@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .discovery import ensure_contained_path, inspect_source_file, resolve_repo_root
+from .mfc import MFC_RULE_VERSION
 from .models import (
     ConditionState,
     DependencyKind,
@@ -36,7 +37,7 @@ from .models import (
 
 CLANG_PARSER_NAME = "clang"
 CLANG_PARSER_VERSION = "0.2.1"
-DEFAULT_MFC_RULE_VERSION = "0.1.0"
+DEFAULT_MFC_RULE_VERSION = MFC_RULE_VERSION
 
 try:
     import clang.cindex as cindex  # type: ignore[import-untyped]
@@ -187,6 +188,7 @@ class ClangParser:
         self.active_macro_offsets: dict[str, set[int]] = {}
         self.macro_offsets_by_tu: dict[str, dict[str, set[int]]] = {}
         self.last_consumed_files: set[str] = set()
+        self.last_file_hashes: dict[str, str] = {}
         self._index: Any | None = None
 
     def _ensure_index(self) -> Any:
@@ -409,6 +411,7 @@ class ClangParser:
 
     def parse(self, spec: TranslationUnitSpec) -> ParseRunPayload:
         """Parse a single translation unit with libclang and return its ParseRunPayload."""
+        self.last_file_hashes = {}
         idx = self._ensure_index()
         try:
             main_abs, main_rel = ensure_contained_path(
@@ -766,6 +769,7 @@ class ClangParser:
         self.active_macro_offsets = macro_offsets
         self.macro_offsets_by_tu[spec.tu_key] = macro_offsets
         self.last_consumed_files = set(pre_hash_by_rel.keys())
+        self.last_file_hashes = dict(pre_hash_by_rel)
 
         if mutated_files:
             diagnostics.append(

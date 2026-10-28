@@ -263,7 +263,9 @@ def _cmd_scan_manifest(args: argparse.Namespace) -> int:
             imported.translation_units,
             deactivate_unlisted_for_contexts=args.deactivate_unlisted,
         )
-        invalidated = store.compute_invalidated_translation_units()
+        invalidated = store.compute_invalidated_translation_units(
+            parser_version=CLANG_PARSER_VERSION, mfc_rule_version=DEFAULT_MFC_RULE_VERSION,
+        )
 
     payload = {
         "db_path": str(db_path),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -12,9 +14,10 @@ from .clang_parser import (
     DEFAULT_MFC_RULE_VERSION,
     ClangParser,
 )
-from .discovery import discover_repository_files, inspect_source_file, resolve_repo_root
+from .discovery import discover_repository_files, ensure_contained_path, inspect_source_file, resolve_repo_root
 from .index import IndexStore
-from .models import FileInventoryRecord, ParseRunPayload, ParseStatus, TranslationUnitSpec
+from .mfc_adapter import augment_payload
+from .models import DiagnosticRecord, DiagnosticSeverity, FileInventoryRecord, ParseRunPayload, ParseStatus, TranslationUnitSpec
 
 SCANNER_VERSION = CLANG_PARSER_VERSION
 
@@ -344,6 +347,11 @@ def scan_repository(
                         continue
 
                     payload = active_parser.parse(spec)
+                    if payload.parse_status == ParseStatus.PARSED_CLEAN:
+                        payload = augment_payload(
+                            payload, spec, canonical_root,
+                            active_macro_offsets=getattr(active_parser, "last_macro_offsets", None),
+                        )
                     extra_synced = _ensure_consumed_files_synced(
                         store,
                         canonical_root,
@@ -354,6 +362,23 @@ def scan_repository(
                         if p not in sync_summary["added"] and p not in sync_summary["unchanged"]:
                             sync_summary["added"].append(p)
 
+                    changed_sources = []
+                    for relative, expected_hash in getattr(active_parser, "last_file_hashes", {}).items():
+                        try:
+                            source_path, _ = ensure_contained_path(canonical_root, relative)
+                            if hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash:
+                                changed_sources.append(relative)
+                        except (OSError, ValueError):
+                            changed_sources.append(relative)
+                    if changed_sources:
+                        payload = replace(
+                            payload, parse_status=ParseStatus.STALE, entities=(), occurrences=(),
+                            observations=(), relations=(), has_incomplete_dependencies=True,
+                            diagnostics=payload.diagnostics + (DiagnosticRecord(
+                                DiagnosticSeverity.ERROR, "scanner.source_changed_after_parse",
+                                "Source changed before persistence: " + ", ".join(sorted(changed_sources)),
+                            ),),
+                        )
                     parse_run_id = store.record_parse_run(gen_id, payload)
                     if payload.parse_status == ParseStatus.PARSED_CLEAN:
                         clean_count += 1
