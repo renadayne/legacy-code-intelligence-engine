@@ -113,6 +113,7 @@ def augment_payload(
     spec: TranslationUnitSpec,
     repo_root: Path | str,
     active_macro_offsets: dict[str, set[int]] | None = None,
+    preferred_legacy_encoding: str = "cp1252",
 ) -> ParseRunPayload:
     """Augment a semantic TU ParseRunPayload with MFC event registrations and resource facts."""
     canonical_root = resolve_repo_root(repo_root)
@@ -183,7 +184,7 @@ def augment_payload(
             raw_bytes = resolved_path.read_bytes()
         except OSError:
             continue
-        encoding, _, _, _ = detect_encoding_and_decode(raw_bytes)
+        encoding, _, _, _ = detect_encoding_and_decode(raw_bytes, preferred_legacy_encoding=preferred_legacy_encoding)
         scan_encoding = "latin-1" if encoding == "binary-or-mixed" else encoding
         try:
             b"".decode(scan_encoding)

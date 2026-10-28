@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import SCHEMA_VERSION, __version__
-from .discovery import discover_repository_files, resolve_repo_root
+from .discovery import SOURCE_EXTENSIONS, discover_repository_files, resolve_repo_root
 from .models import (
     BuildContextSpec,
     CandidateTargetRecord,
@@ -312,6 +312,8 @@ class IndexStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path).resolve(strict=False)
+        if self.db_path.suffix.lower() in SOURCE_EXTENSIONS:
+            raise ValueError("The index database cannot use a source/project file extension.")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row

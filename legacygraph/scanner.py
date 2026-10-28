@@ -351,6 +351,7 @@ def scan_repository(
                         payload = augment_payload(
                             payload, spec, canonical_root,
                             active_macro_offsets=getattr(active_parser, "last_macro_offsets", None),
+                            preferred_legacy_encoding=preferred_legacy_encoding,
                         )
                     extra_synced = _ensure_consumed_files_synced(
                         store,

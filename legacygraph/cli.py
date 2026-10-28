@@ -10,6 +10,7 @@ from typing import Sequence
 
 from .build_context import load_build_manifest
 from .clang_parser import CLANG_PARSER_VERSION, DEFAULT_MFC_RULE_VERSION, LibclangUnavailableError
+from .cli_queries import register_query_commands
 from .discovery import discover_repository_files, resolve_repo_root
 from .index import IndexStore
 from .scanner import scan_repository
@@ -162,7 +163,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit output in JSON format.",
     )
+    p_scan.add_argument('--legacy-encoding', default='cp1252', help='Fallback source encoding, e.g. cp932.')
 
+    register_query_commands(subparsers)
     return parser
 
 
@@ -346,6 +349,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             db_path=args.db,
             manifest_path=args.manifest,
             force=args.force,
+            preferred_legacy_encoding=args.legacy_encoding,
         )
     except LibclangUnavailableError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -373,6 +377,9 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if hasattr(args, 'query_handler'):
+        return args.query_handler(args)
 
     if args.command == "init":
         return _cmd_init(args)

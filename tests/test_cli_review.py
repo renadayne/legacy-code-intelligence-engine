@@ -12,6 +12,14 @@ from legacygraph.index import IndexStore
 
 
 class CliReviewTests(unittest.TestCase):
+    def test_database_cannot_replace_an_empty_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'empty.cpp'
+            source.touch()
+            with self.assertRaises(ValueError):
+                IndexStore(source)
+            self.assertEqual(source.read_bytes(), b'')
+
     def test_index_cannot_be_rebound_to_a_different_source_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
