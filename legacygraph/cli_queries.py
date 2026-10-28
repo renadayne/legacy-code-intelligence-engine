@@ -21,6 +21,7 @@ def register_query_commands(subparsers) -> None:
         'graph': 'Retrieve a bounded dependency subgraph.',
         'path': 'Find a bounded static dependency path.',
         'export': 'Export a source-based Markdown or JSON context pack.',
+        'serve': 'Run the local-only graph explorer.',
     }
     for name, description in descriptions.items():
         parser = subparsers.add_parser(name, help=description)

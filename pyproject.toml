@@ -24,3 +24,6 @@ legacygraph = "legacygraph.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["legacygraph*"]
+
+[tool.setuptools.package-data]
+legacygraph = ["static/*.html", "static/*.js", "static/*.css"]

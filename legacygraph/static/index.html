@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="legacygraph-token" content="__LEGACYGRAPH_SESSION_TOKEN__">
+  <title>LegacyGraph Explorer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar" role="banner">
+    <div class="brand-group">
+      <h1 class="brand-title">LegacyGraph</h1>
+      <span id="status-badge" class="badge badge-neutral" role="status" aria-live="polite">Loading index…</span>
+      <span id="partial-badge" class="badge badge-warn hidden" title="Index has incomplete dependencies or invalidated TUs">Partial Index</span>
+    </div>
+
+    <div class="controls-bar" role="region" aria-label="Graph Query Controls">
+      <label class="ctrl-item" for="context-select">
+        <span>Build Context</span>
+        <select id="context-select" aria-label="Build Context"></select>
+      </label>
+
+      <label class="ctrl-item" for="direction-select">
+        <span>Direction</span>
+        <select id="direction-select" aria-label="Traversal Direction">
+          <option value="out" selected>Outbound (Callees)</option>
+          <option value="in">Inbound (Callers)</option>
+          <option value="both">Both Directions</option>
+        </select>
+      </label>
+
+      <label class="ctrl-item" for="depth-input">
+        <span>Depth</span>
+        <input id="depth-input" type="number" min="1" max="6" value="1" aria-label="Subgraph Depth">
+      </label>
+
+      <label class="ctrl-item" for="max-nodes-input">
+        <span>Max Nodes</span>
+        <input id="max-nodes-input" type="number" min="10" max="500" value="100" aria-label="Maximum Nodes">
+      </label>
+
+      <label class="ctrl-item" for="max-edges-input">
+        <span>Max Edges</span>
+        <input id="max-edges-input" type="number" min="10" max="1500" value="300" aria-label="Maximum Edges">
+      </label>
+
+      <fieldset class="filter-group" aria-label="Relation Kinds">
+        <legend>Relations</legend>
+        <label><input type="checkbox" name="rel-kind" value="calls" checked> calls</label>
+        <label><input type="checkbox" name="rel-kind" value="handles_event" checked> handles_event</label>
+        <label><input type="checkbox" name="rel-kind" value="registers_callback" checked> callback</label>
+        <label><input type="checkbox" name="rel-kind" value="inherits" checked> inherits</label>
+        <label><input type="checkbox" name="rel-kind" value="overrides" checked> overrides</label>
+        <label><input type="checkbox" name="rel-kind" value="may_dispatch_to" checked> virtual</label>
+        <label><input type="checkbox" name="rel-kind" value="reads_state"> reads</label>
+        <label><input type="checkbox" name="rel-kind" value="writes_state"> writes</label>
+      </fieldset>
+
+      <fieldset class="filter-group" aria-label="Resolution Statuses">
+        <legend>Status</legend>
+        <label><input type="checkbox" name="res-status" value="resolved" checked> resolved</label>
+        <label><input type="checkbox" name="res-status" value="ambiguous" checked> ambiguous</label>
+        <label><input type="checkbox" name="res-status" value="unresolved" checked> unresolved</label>
+      </fieldset>
+    </div>
+  </header>
+
+  <div id="global-alert" class="alert-banner hidden" role="alert" aria-live="assertive"></div>
+
+  <main class="workspace">
+    <!-- Left Pane: Search, Path Finder, Export -->
+    <aside class="pane pane-left" aria-label="Search and Path Tools">
+      <section class="panel-section">
+        <h2 class="section-title">Symbol Search</h2>
+        <form id="search-form" class="search-row">
+          <input id="search-input" type="search" placeholder="Search classes, methods, MFC handlers…" aria-label="Search Symbols" autocomplete="off">
+          <button type="submit" id="search-btn" class="btn btn-primary">Find</button>
+        </form>
+        <div id="search-meta" class="meta-line" role="status" aria-live="polite"></div>
+        <ul id="search-results" class="result-list" role="listbox" aria-label="Search Results"></ul>
+      </section>
+
+      <section class="panel-section">
+        <h2 class="section-title">Bounded Path Finder</h2>
+        <div class="form-stack">
+          <label for="path-source">Source Symbol Key / ID</label>
+          <input id="path-source" type="text" placeholder="Select node or enter source key" aria-label="Path Source Symbol">
+          <label for="path-target">Target Symbol Key / ID</label>
+          <input id="path-target" type="text" placeholder="Select node or enter target key" aria-label="Path Target Symbol">
+          <div class="btn-row">
+            <button type="button" id="find-path-btn" class="btn btn-primary">Find Path</button>
+            <button type="button" id="clear-path-btn" class="btn">Clear Path</button>
+          </div>
+          <div id="path-summary" class="meta-line" role="status" aria-live="polite"></div>
+          <ol id="path-steps" class="compact-list"></ol>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <h2 class="section-title">Export AI Context Pack</h2>
+        <div class="form-stack">
+          <div class="split-row">
+            <label for="export-format">Format
+              <select id="export-format" aria-label="Export Format">
+                <option value="markdown" selected>Markdown (.md)</option>
+                <option value="json">JSON (.json)</option>
+              </select>
+            </label>
+            <label for="export-budget">Token Budget
+              <input id="export-budget" type="number" min="256" max="64000" value="8000" aria-label="Token Budget">
+            </label>
+          </div>
+          <button type="button" id="export-btn" class="btn btn-accent">Download Seed Context Pack</button>
+          <div id="export-status" class="meta-line" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Center Pane: Bounded Directed SVG Graph -->
+    <section class="pane pane-center" aria-label="Interactive Call and Event Graph">
+      <div class="graph-toolbar">
+        <div class="btn-row">
+          <button type="button" id="zoom-in-btn" class="btn" aria-label="Zoom In" title="Zoom In">+</button>
+          <button type="button" id="zoom-out-btn" class="btn" aria-label="Zoom Out" title="Zoom Out">−</button>
+          <button type="button" id="fit-graph-btn" class="btn" aria-label="Fit Graph to View">Fit View</button>
+          <button type="button" id="reload-subgraph-btn" class="btn" aria-label="Reload Seed Subgraph">Reload Seeds</button>
+          <button type="button" id="clear-graph-btn" class="btn" aria-label="Clear Graph">Clear</button>
+        </div>
+        <div class="graph-legend" aria-label="Edge Legend">
+          <span class="legend-item"><i class="swatch swatch-direct"></i>direct call</span>
+          <span class="legend-item"><i class="swatch swatch-event"></i>event-registration</span>
+          <span class="legend-item"><i class="swatch swatch-virtual"></i>virtual / override</span>
+          <span class="legend-item"><i class="swatch swatch-ambiguous"></i>ambiguous / unresolved</span>
+        </div>
+      </div>
+
+      <div id="graph-banners" class="banner-stack" role="status" aria-live="polite"></div>
+
+      <div id="graph-container" class="graph-canvas-wrap">
+        <div id="graph-empty" class="empty-overlay">
+          Select a symbol from search results to explore its bounded call &amp; event neighborhood.
+          <span class="sub-hint">Full-repository rendering is disabled (default cap: 100 nodes / 300 edges).</span>
+        </div>
+        <svg id="graph-svg" tabindex="0" aria-label="Directed Dependency Graph">
+          <defs>
+            <marker id="arrow-direct" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#60a5fa"></path>
+            </marker>
+            <marker id="arrow-event" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b"></path>
+            </marker>
+            <marker id="arrow-virtual" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"></path>
+            </marker>
+            <marker id="arrow-ambiguous" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#f87171"></path>
+            </marker>
+          </defs>
+          <g id="graph-viewport">
+            <g id="graph-edges"></g>
+            <g id="graph-nodes"></g>
+          </g>
+        </svg>
+      </div>
+      <footer class="graph-footer">
+        <span id="graph-stats">0 nodes · 0 edges · 0 seeds</span>
+        <span id="seed-pills" class="seed-pills"></span>
+      </footer>
+    </section>
+
+    <!-- Right Pane: Selected Symbol Details, Source Snippet, Evidence -->
+    <aside class="pane pane-right" aria-label="Selected Symbol Source and Evidence">
+      <section class="panel-section">
+        <div class="section-header-row">
+          <h2 class="section-title">Selected Symbol</h2>
+          <div id="symbol-badges" class="badge-row"></div>
+        </div>
+        <div id="symbol-details" class="symbol-card empty-text">No symbol selected.</div>
+        <div id="symbol-actions" class="btn-row wrap-row hidden">
+          <button type="button" id="expand-node-btn" class="btn btn-primary">Expand Neighbors</button>
+          <button type="button" id="collapse-node-btn" class="btn">Collapse Expansion</button>
+          <button type="button" id="set-source-btn" class="btn">Set Path Source</button>
+          <button type="button" id="set-target-btn" class="btn">Set Path Target</button>
+        </div>
+      </section>
+
+      <section class="panel-section snippet-section">
+        <div class="section-header-row">
+          <h2 class="section-title">Source Snippet</h2>
+          <label class="wrap-toggle-label" for="wrap-toggle">
+            <input type="checkbox" id="wrap-toggle"> Wrap lines
+          </label>
+        </div>
+        <div id="snippet-meta" class="meta-line">Select a symbol to view source by symbol ID.</div>
+        <pre id="snippet-pre" class="code-viewer"><code id="snippet-code"></code></pre>
+      </section>
+
+      <section class="panel-section evidence-section">
+        <h2 class="section-title">Relations &amp; Evidence</h2>
+        <ul id="evidence-list" class="evidence-list"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -32,3 +32,4 @@ Thumbs.db
 Desktop.ini
 *.tmp
 *.bak
+.playwright-mcp/
