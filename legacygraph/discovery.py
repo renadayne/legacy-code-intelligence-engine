@@ -97,19 +97,32 @@ def ensure_contained_path(
     return resolved, rel_posix
 
 
-def compute_line_byte_offsets(raw_bytes: bytes) -> tuple[int, ...]:
+def compute_line_byte_offsets(raw_bytes: bytes, encoding: str = "utf-8") -> tuple[int, ...]:
     """Return 0-based starting byte offsets for each 1-based line in `raw_bytes`."""
     if not raw_bytes:
         return (0,)
     offsets = [0]
+    normalized_encoding = encoding.lower().replace("_", "-")
+    unit = 1
+    newline = b"\n"
+    if normalized_encoding.startswith("utf-16"):
+        unit = 2
+        newline = b"\x00\n" if normalized_encoding.endswith("be") else b"\n\x00"
+    elif normalized_encoding.startswith("utf-32"):
+        unit = 4
+        newline = b"\x00\x00\x00\n" if normalized_encoding.endswith("be") else b"\n\x00\x00\x00"
     pos = 0
     while True:
-        idx = raw_bytes.find(b"\n", pos)
+        idx = raw_bytes.find(newline, pos)
         if idx == -1:
             break
-        if idx + 1 < len(raw_bytes):
-            offsets.append(idx + 1)
-        pos = idx + 1
+        if idx % unit:
+            pos = idx + 1
+            continue
+        next_line = idx + len(newline)
+        if next_line < len(raw_bytes):
+            offsets.append(next_line)
+        pos = next_line
     return tuple(offsets)
 
 
@@ -186,7 +199,7 @@ def inspect_source_file(
     encoding, has_bom, decode_clean, _ = detect_encoding_and_decode(
         raw_bytes, preferred_legacy_encoding=preferred_legacy_encoding
     )
-    line_offsets = compute_line_byte_offsets(raw_bytes)
+    line_offsets = compute_line_byte_offsets(raw_bytes, encoding)
     ext = resolved_path.suffix.lower()
     file_role = SOURCE_EXTENSIONS.get(ext, "other")
 

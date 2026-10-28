@@ -1087,9 +1087,9 @@ class IndexStore:
                     ),
                 )
 
-            # Per Section 6.3: When a TU parse fails completely (ParseStatus.FAILED),
-            # remove it from the current verified graph for this generation while preserving history.
-            if payload.parse_status == ParseStatus.FAILED:
+            # Keep recovered/error runs for diagnostics, but only clean parses
+            # participate in the current verified graph.
+            if payload.parse_status != ParseStatus.PARSED_CLEAN:
                 self._conn.execute(
                     "DELETE FROM generation_tu_runs WHERE generation_id = ? AND translation_unit_id = ?",
                     (generation_id, tu_id),
