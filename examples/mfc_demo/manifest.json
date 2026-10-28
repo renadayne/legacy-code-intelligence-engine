@@ -1,0 +1,19 @@
+{
+  "contexts": [
+    {
+      "id": "demo-debug",
+      "project_name": "MfcLikeDemo",
+      "target_name": "Demo",
+      "configuration": "Debug",
+      "platform": "x64",
+      "compiler_family": "clang",
+      "language_standard": "c++17",
+      "include_dirs": ["."],
+      "defines": ["_DEBUG"]
+    }
+  ],
+  "translation_units": [
+    {"file": "demo.cpp", "context_id": "demo-debug"},
+    {"file": "model.cpp", "context_id": "demo-debug"}
+  ]
+}

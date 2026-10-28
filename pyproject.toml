@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legacygraph"
+version = "0.1.0"
+description = "Offline source code intelligence foundation for legacy C++/MFC repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    {name = "LegacyGraph Contributors"}
+]
+dependencies = []
+
+[project.scripts]
+legacygraph = "legacygraph.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["legacygraph*"]
