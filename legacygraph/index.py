@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import sqlite3
@@ -314,12 +315,35 @@ class IndexStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        self._savepoint_counter = 0
         self._configure_connection()
 
     def _configure_connection(self) -> None:
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA journal_mode = WAL;")
         self._conn.execute("PRAGMA synchronous = NORMAL;")
+
+    @contextmanager
+    def atomic_update(self):
+        """Compose writes without committing an enclosing scan transaction."""
+        nested = self._conn.in_transaction
+        self._savepoint_counter += 1
+        name = f"legacygraph_{self._savepoint_counter}"
+        self._conn.execute(f"SAVEPOINT {name}" if nested else "BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            if nested:
+                self._conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                self._conn.execute(f"RELEASE SAVEPOINT {name}")
+            else:
+                self._conn.rollback()
+            raise
+        else:
+            if nested:
+                self._conn.execute(f"RELEASE SAVEPOINT {name}")
+            else:
+                self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -334,7 +358,7 @@ class IndexStore:
         """Create or verify the versioned schema and register the canonical repository root."""
         canonical_root = str(resolve_repo_root(repo_root))
         now = _utc_now_iso()
-        with self._conn:
+        with self.atomic_update():
             self._conn.executescript(SCHEMA_DDL)
             existing_ver = self._get_meta("schema_version")
             if existing_ver is not None and int(existing_ver) != SCHEMA_VERSION:
@@ -426,7 +450,7 @@ class IndexStore:
         deleted: list[str] = []
 
         seen_paths: set[str] = set()
-        with self._conn:
+        with self.atomic_update():
             existing_rows = self._conn.execute(
                 """
                 SELECT f.id, f.repo_path, f.is_deleted, f.current_version_id, fv.content_sha256
@@ -543,7 +567,7 @@ class IndexStore:
     def register_build_context(self, ctx: BuildContextSpec) -> int:
         """Upsert a project and build context specification."""
         repo_id = self.get_active_repository_id()
-        with self._conn:
+        with self.atomic_update():
             return self._register_build_context_in_tx(repo_id, ctx)
 
     def _register_build_context_in_tx(self, repo_id: int, ctx: BuildContextSpec) -> int:
@@ -615,7 +639,7 @@ class IndexStore:
         tu_ids: list[int] = []
         seen_by_context: dict[int, set[str]] = {}
 
-        with self._conn:
+        with self.atomic_update():
             for spec in tu_specs:
                 ctx_id = self._register_build_context_in_tx(repo_id, spec.build_context)
                 file_id = self._ensure_file_placeholder(spec.main_file_path)
@@ -681,7 +705,7 @@ class IndexStore:
         repo_id = self.get_active_repository_id()
         parent_gen_id = self.get_published_generation_id() if inherit_from_published else None
         now = _utc_now_iso()
-        with self._conn:
+        with self.atomic_update():
             cur = self._conn.execute(
                 """
                 INSERT INTO generations(
@@ -719,7 +743,7 @@ class IndexStore:
     def retract_translation_unit_from_generation(self, generation_id: int, tu_key: str) -> bool:
         """Retract a translation unit's observations from the specified staging generation."""
         self._assert_generation_staging(generation_id)
-        with self._conn:
+        with self.atomic_update():
             row = self._conn.execute(
                 "SELECT id FROM translation_units WHERE tu_key = ?",
                 (tu_key,),
@@ -738,7 +762,7 @@ class IndexStore:
         repo_id = self.get_active_repository_id()
         now = _utc_now_iso()
 
-        with self._conn:
+        with self.atomic_update():
             tu_row = self._conn.execute(
                 """
                 SELECT tu.id AS tu_id, tu.build_context_id, tu.flags_fingerprint,
@@ -1112,7 +1136,7 @@ class IndexStore:
         self._assert_generation_staging(generation_id)
         now = _utc_now_iso()
         prev_published = self.get_published_generation_id()
-        with self._conn:
+        with self.atomic_update():
             if prev_published is not None and prev_published != generation_id:
                 self._conn.execute(
                     "UPDATE generations SET status = ? WHERE id = ? AND status = ?",
@@ -1131,7 +1155,7 @@ class IndexStore:
     def rollback_generation(self, generation_id: int) -> None:
         """Mark a staging generation as rolled back without affecting the published generation."""
         self._assert_generation_staging(generation_id)
-        with self._conn:
+        with self.atomic_update():
             self._conn.execute(
                 "UPDATE generations SET status = ? WHERE id = ?",
                 (GenerationStatus.ROLLED_BACK.value, generation_id),

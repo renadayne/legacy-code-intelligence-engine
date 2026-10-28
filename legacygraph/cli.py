@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Sequence
 
 from .build_context import load_build_manifest
+from .clang_parser import CLANG_PARSER_VERSION, DEFAULT_MFC_RULE_VERSION, LibclangUnavailableError
 from .discovery import discover_repository_files, resolve_repo_root
 from .index import IndexStore
+from .scanner import scan_repository
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -125,6 +127,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Include list of translation units invalidated relative to the published generation.",
     )
     p_stat.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit output in JSON format.",
+    )
+
+    # scan
+    p_scan = subparsers.add_parser(
+        "scan",
+        help="Run incremental or full semantic C++ indexing and atomically publish a verified generation.",
+    )
+    p_scan.add_argument(
+        "--repo",
+        default=".",
+        help="Path to the target repository root.",
+    )
+    p_scan.add_argument(
+        "--db",
+        default=".legacygraph/index.db",
+        help="Path to the SQLite index file.",
+    )
+    p_scan.add_argument(
+        "--manifest",
+        required=True,
+        help="Path to the authoritative build manifest or compile_commands.json.",
+    )
+    p_scan.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-parsing all active translation units even if unchanged.",
+    )
+    p_scan.add_argument(
         "--json",
         action="store_true",
         help="Emit output in JSON format.",
@@ -274,7 +307,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
         summary = store.get_status_summary()
         if args.check_invalidated:
             summary["invalidated_translation_units"] = (
-                store.compute_invalidated_translation_units()
+                store.compute_invalidated_translation_units(
+                    parser_version=CLANG_PARSER_VERSION,
+                    mfc_rule_version=DEFAULT_MFC_RULE_VERSION,
+                )
             )
 
     if args.json:
@@ -301,6 +337,37 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        summary = scan_repository(
+            repo_root=args.repo,
+            db_path=args.db,
+            manifest_path=args.manifest,
+            force=args.force,
+        )
+    except LibclangUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"Database:                   {summary['db_path']}")
+        print(f"Repository root:            {summary['repo_root']}")
+        print(f"Generation ID:              #{summary['generation_id']} (no-op={summary['noop']})")
+        print(
+            f"Translation units:          {summary['parsed_translation_units']} parsed "
+            f"({summary['clean_translation_units']} clean, {summary['failed_translation_units']} failed), "
+            f"{summary['reused_translation_units']} reused"
+        )
+        if summary["diagnostics"]:
+            print(f"Diagnostics surfaced:       {len(summary['diagnostics'])}")
+    return 3 if summary["failed_translation_units"] else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -313,5 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_scan_manifest(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "scan":
+        return _cmd_scan(args)
     parser.print_help()
     return 1
