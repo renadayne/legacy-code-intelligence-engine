@@ -144,6 +144,7 @@ storage, query, export and HTTP tests require only the standard library.
 
 ```powershell
 python -m legacygraph contexts --db .legacygraph\demo.db
+python -m legacygraph diagnostics --db .legacygraph\demo.db --blocking-only --json
 python -m legacygraph search OnSave --db .legacygraph\demo.db
 python -m legacygraph neighbors COrderDlg::OnSave --direction in --db .legacygraph\demo.db
 python -m legacygraph path COrderDlg::OnSave SaveOrder --kinds calls --db .legacygraph\demo.db

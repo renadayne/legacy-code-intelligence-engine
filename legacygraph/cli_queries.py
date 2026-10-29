@@ -14,6 +14,7 @@ from .index import IndexStore
 def register_query_commands(subparsers) -> None:
     descriptions = {
         'contexts': 'List indexed build contexts.',
+        'diagnostics': 'Inspect persisted per-TU diagnostics and grouped blocker summaries.',
         'search': 'Search symbol names in the published index.',
         'symbol': 'Inspect a symbol and its indexed source locations.',
         'snippet': 'Read original source after checking its indexed hash.',
@@ -35,6 +36,13 @@ def register_query_commands(subparsers) -> None:
         if name == 'contexts':
             continue
         parser.add_argument('--context', default=None, help='Exact context key; optional when only one is indexed.')
+        if name == 'diagnostics':
+            parser.add_argument('--tu', default=None, help='Optional translation unit key filter.')
+            parser.add_argument('--severity', default=None, help='Optional severity filter (info, warning, error, fatal, unsupported).')
+            parser.add_argument('--class', dest='diagnostic_class', default=None, help='Optional diagnostic_class filter.')
+            parser.add_argument('--blocking-only', action='store_true', help='Include only error/fatal/unsupported diagnostics.')
+            parser.add_argument('--limit', type=int, default=500)
+            continue
         if name == 'search':
             parser.add_argument('query', nargs='?', default='')
             parser.add_argument('--limit', type=int, default=50)
@@ -110,6 +118,15 @@ def run_query(args: argparse.Namespace) -> int:
             service = QueryService(store)
             if args.command == 'contexts':
                 result = {'contexts': service.contexts()}
+            elif args.command == 'diagnostics':
+                result = service.diagnostics(
+                    context_key=args.context,
+                    tu_key=args.tu,
+                    severity=args.severity,
+                    diagnostic_class=args.diagnostic_class,
+                    blocking_only=args.blocking_only,
+                    limit=args.limit,
+                )
             elif args.command == 'search':
                 result = service.search(args.query, context_key=args.context, limit=args.limit, offset=args.offset)
             else:

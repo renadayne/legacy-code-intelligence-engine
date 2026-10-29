@@ -7,7 +7,6 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
-from .progress import Progress
 from typing import Any, Callable, Iterable
 
 from .build_context import load_build_manifest
@@ -20,7 +19,19 @@ from .clang_parser import (
 from .discovery import discover_repository_files, ensure_contained_path, inspect_source_file, resolve_repo_root
 from .index import IndexStore
 from .mfc_adapter import augment_payload
-from .models import DiagnosticRecord, DiagnosticSeverity, FileInventoryRecord, ParseRunPayload, ParseStatus, TranslationUnitSpec
+from .models import (
+    DiagnosticClass,
+    DiagnosticLocationProvenance,
+    DiagnosticLocationQuality,
+    DiagnosticRecord,
+    DiagnosticSeverity,
+    FileInventoryRecord,
+    ParseRunPayload,
+    ParseStatus,
+    TranslationUnitSpec,
+    format_diagnostic_record,
+)
+from .progress import Progress
 
 SCANNER_VERSION = CLANG_PARSER_VERSION
 
@@ -150,21 +161,35 @@ def scan_repository(
 ) -> dict[str, Any]:
     """Scan transactionally; optional privacy-safe events never change results."""
     progress = Progress(on_event, clock)
-    progress.emit('scan', 'started')
+    progress.emit("scan", "started")
     try:
         result = _scan_repository(
-            repo_root, db_path, manifest_path, force=force, source_revision=source_revision,
-            exclude_dirs=exclude_dirs, preferred_legacy_encoding=preferred_legacy_encoding,
-            parser=parser, parser_input_policy=parser_input_policy, parser_version=parser_version,
-            mfc_rule_version=mfc_rule_version, on_before_publish=on_before_publish,
+            repo_root,
+            db_path,
+            manifest_path,
+            force=force,
+            source_revision=source_revision,
+            exclude_dirs=exclude_dirs,
+            preferred_legacy_encoding=preferred_legacy_encoding,
+            parser=parser,
+            parser_input_policy=parser_input_policy,
+            parser_version=parser_version,
+            mfc_rule_version=mfc_rule_version,
+            on_before_publish=on_before_publish,
             progress=progress,
         )
     except BaseException as exc:
-        progress.interrupted('cancelled' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed')
+        progress.interrupted(
+            "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        )
         raise
-    if not result['noop']:
-        progress.emit('publication', 'finished', committed=True,
-                      elapsed_s=clock()-progress.publication_start)
+    if not result["noop"]:
+        progress.emit(
+            "publication",
+            "finished",
+            committed=True,
+            elapsed_s=clock() - progress.publication_start,
+        )
     progress.complete(result)
     return result
 
@@ -195,10 +220,16 @@ def _scan_repository(
     5. Atomically publish the staging generation; roll back on any unexpected exception so the previous published snapshot remains intact.
     """
     canonical_root = resolve_repo_root(repo_root)
-    active_parser = parser if parser is not None else ClangParser(
-        canonical_root, parser_version=parser_version, mfc_rule_version=mfc_rule_version,
-        preferred_legacy_encoding=preferred_legacy_encoding,
-        parser_input_policy=parser_input_policy,
+    active_parser = (
+        parser
+        if parser is not None
+        else ClangParser(
+            canonical_root,
+            parser_version=parser_version,
+            mfc_rule_version=mfc_rule_version,
+            preferred_legacy_encoding=preferred_legacy_encoding,
+            parser_input_policy=parser_input_policy,
+        )
     )
     resolved_db = Path(db_path)
     if not resolved_db.is_absolute():
@@ -283,21 +314,31 @@ def _scan_repository(
                 # A newly added header can shadow an unchanged consumed header in
                 # an earlier include directory. Reverse dependency hashes alone
                 # cannot detect that change in include resolution.
-                added_headers = [path for path in sync_summary["added"]
-                                 if discovered_map[path].file_role in ("header", "inline_header")]
+                added_headers = [
+                    path
+                    for path in sync_summary["added"]
+                    if discovered_map[path].file_role in ("header", "inline_header")
+                ]
                 if added_headers:
                     for key, spec in active_specs_by_key.items():
-                        invalidated_by_key.setdefault(key, {
-                            "tu_key": key, "context_key": spec.build_context.context_key,
-                            "main_repo_path": spec.main_file_path,
-                            "reasons": ["include_search_changed:new_header"],
-                        })
-                    invalidated_items = [invalidated_by_key[key] for key in sorted(invalidated_by_key)]
+                        invalidated_by_key.setdefault(
+                            key,
+                            {
+                                "tu_key": key,
+                                "context_key": spec.build_context.context_key,
+                                "main_repo_path": spec.main_file_path,
+                                "reasons": ["include_search_changed:new_header"],
+                            },
+                        )
+                    invalidated_items = [
+                        invalidated_by_key[key] for key in sorted(invalidated_by_key)
+                    ]
 
                 prev_published_id = store.get_published_generation_id()
                 if force:
                     tus_to_parse = [
-                        spec for _, spec in sorted(active_specs_by_key.items(), key=lambda kv: kv[0])
+                        spec
+                        for _, spec in sorted(active_specs_by_key.items(), key=lambda kv: kv[0])
                     ]
                 else:
                     tus_to_parse = [
@@ -306,10 +347,17 @@ def _scan_repository(
                         if tkey in active_specs_by_key
                     ]
 
-            progress.emit('schedule', 'finished', requested=len(active_specs_by_key),
-                          selected=len(tus_to_parse), reused=len(active_specs_by_key)-len(tus_to_parse),
-                          deleted=sum('main_file_deleted' in item['reasons'] for item in invalidated_items),
-                          deactivated=len(deactivated_tu_keys))
+            progress.emit(
+                "schedule",
+                "finished",
+                requested=len(active_specs_by_key),
+                selected=len(tus_to_parse),
+                reused=len(active_specs_by_key) - len(tus_to_parse),
+                deleted=sum(
+                    "main_file_deleted" in item["reasons"] for item in invalidated_items
+                ),
+                deactivated=len(deactivated_tu_keys),
+            )
 
             # Incremental no-op: if nothing is invalidated, no TUs were deactivated, no files were deleted,
             # and a published generation already exists with matching versions, skip creating a redundant generation.
@@ -343,11 +391,13 @@ def _scan_repository(
                     "failed_translation_units": 0,
                     "tu_results": [],
                     "diagnostics": [],
+                    "blocker_summaries": status_after["blocker_summaries"],
+                    "diagnostic_summary": status_after["diagnostic_summary"],
                     "warnings": list(imported.warnings),
                     "published_generation": status_after["published_generation"],
                 }
 
-            with progress.phase('generation_creation'):
+            with progress.phase("generation_creation"):
                 gen_id = store.begin_generation(
                     parser_version=eff_parser_version,
                     mfc_rule_version=eff_mfc_version,
@@ -360,23 +410,47 @@ def _scan_repository(
                 clean_count = 0
                 failed_count = 0
 
-                with progress.phase('tu_processing'):
+                with progress.phase("tu_processing"):
                     for ordinal, spec in enumerate(tus_to_parse, 1):
                         progress.tu = dict(tu=ordinal, scheduled=len(tus_to_parse))
                         tu_started = progress.clock()
-                        progress.emit('tu', 'started')
+                        progress.emit("tu", "started")
                         inv_info = invalidated_by_key.get(spec.tu_key)
-                        reasons = inv_info["reasons"] if inv_info else (["forced"] if force else [])
+                        reasons = (
+                            inv_info["reasons"] if inv_info else (["forced"] if force else [])
+                        )
 
                         if "main_file_deleted" in reasons:
-                            with progress.phase('persistence'):
-                                store.retract_translation_unit_from_generation(gen_id, spec.tu_key)
+                            with progress.phase("persistence"):
+                                store.retract_translation_unit_from_generation(
+                                    gen_id, spec.tu_key
+                                )
                             failed_count += 1
                             diag_entry = {
                                 "tu_key": spec.tu_key,
                                 "main_file_path": spec.main_file_path,
                                 "severity": "fatal",
                                 "code": "scanner.main_file_deleted",
+                                "context_key": spec.build_context.context_key,
+                                "parse_run_id": None,
+                                "parse_status": ParseStatus.FAILED.value,
+                                "reused": False,
+                                "is_inherited": False,
+                                "tu_snapshot_state": "main_file_deleted",
+                                "parse_scope": "tu",
+                                "col": None,
+                                "start_line": None,
+                                "start_col": None,
+                                "end_line": None,
+                                "end_col": None,
+                                "byte_start": None,
+                                "byte_end": None,
+                                "content_sha256": None,
+                                "location_quality": DiagnosticLocationQuality.NONE.value,
+                                "location_provenance": DiagnosticLocationProvenance.MISSING_FILE.value,
+                                "is_exact_location": False,
+                                "diagnostic_option": "",
+                                "diagnostic_class": DiagnosticClass.MISSING_INCLUDE.value,
                                 "message": f"Main source file '{spec.main_file_path}' is missing or deleted.",
                                 "repo_path": spec.main_file_path,
                                 "line": None,
@@ -398,10 +472,12 @@ def _scan_repository(
                                     "diagnostic_count": 1,
                                 }
                             )
-                            progress.tu_result(ParseStatus.FAILED.value, {'fatal': 1}, tu_started)
+                            progress.tu_result(
+                                ParseStatus.FAILED.value, {"fatal": 1}, tu_started
+                            )
                             continue
 
-                        with progress.phase('parse'):
+                        with progress.phase("parse"):
                             # Only our exact parser implementation opts into private
                             # instrumentation. Custom parse(spec) signatures stay intact.
                             if type(active_parser) is ClangParser:
@@ -417,8 +493,12 @@ def _scan_repository(
                         with progress.phase("augmentation"):
                             if payload.parse_status == ParseStatus.PARSED_CLEAN:
                                 payload = augment_payload(
-                                    payload, spec, canonical_root,
-                                    active_macro_offsets=getattr(active_parser, "last_macro_offsets", None),
+                                    payload,
+                                    spec,
+                                    canonical_root,
+                                    active_macro_offsets=getattr(
+                                        active_parser, "last_macro_offsets", None
+                                    ),
                                     preferred_legacy_encoding=preferred_legacy_encoding,
                                 )
                         with progress.phase("consumed_inventory_sync"):
@@ -429,26 +509,46 @@ def _scan_repository(
                                 preferred_legacy_encoding=preferred_legacy_encoding,
                             )
                             for p in extra_synced:
-                                if p not in sync_summary["added"] and p not in sync_summary["unchanged"]:
+                                if (
+                                    p not in sync_summary["added"]
+                                    and p not in sync_summary["unchanged"]
+                                ):
                                     sync_summary["added"].append(p)
 
                         with progress.phase("source_validation"):
                             changed_sources = []
-                            for relative, expected_hash in getattr(active_parser, "last_file_hashes", {}).items():
+                            for relative, expected_hash in getattr(
+                                active_parser, "last_file_hashes", {}
+                            ).items():
                                 try:
-                                    source_path, _ = ensure_contained_path(canonical_root, relative)
-                                    if hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash:
+                                    source_path, _ = ensure_contained_path(
+                                        canonical_root, relative
+                                    )
+                                    if (
+                                        hashlib.sha256(source_path.read_bytes()).hexdigest()
+                                        != expected_hash
+                                    ):
                                         changed_sources.append(relative)
                                 except (OSError, ValueError):
                                     changed_sources.append(relative)
                             if changed_sources:
                                 payload = replace(
-                                    payload, parse_status=ParseStatus.STALE, entities=(), occurrences=(),
-                                    observations=(), relations=(), has_incomplete_dependencies=True,
-                                    diagnostics=payload.diagnostics + (DiagnosticRecord(
-                                        DiagnosticSeverity.ERROR, "scanner.source_changed_after_parse",
-                                        "Source changed before persistence: " + ", ".join(sorted(changed_sources)),
-                                    ),),
+                                    payload,
+                                    parse_status=ParseStatus.STALE,
+                                    entities=(),
+                                    occurrences=(),
+                                    observations=(),
+                                    relations=(),
+                                    has_incomplete_dependencies=True,
+                                    diagnostics=payload.diagnostics
+                                    + (
+                                        DiagnosticRecord(
+                                            DiagnosticSeverity.ERROR,
+                                            "scanner.source_changed_after_parse",
+                                            "Source changed before persistence: "
+                                            + ", ".join(sorted(changed_sources)),
+                                        ),
+                                    ),
                                 )
                         with progress.phase("persistence"):
                             parse_run_id = store.record_parse_run(gen_id, payload)
@@ -458,18 +558,30 @@ def _scan_repository(
                             failed_count += 1
 
                         for d in payload.diagnostics:
+                            sha_val = None
+                            if d.span is not None and d.span.repo_path in discovered_map:
+                                sha_val = discovered_map[d.span.repo_path].content_sha256
+                            elif d.span is not None:
+                                sha_val = getattr(active_parser, "last_file_hashes", {}).get(
+                                    d.span.repo_path
+                                )
                             surfaced_diagnostics.append(
-                                {
-                                    "tu_key": spec.tu_key,
-                                    "main_file_path": spec.main_file_path,
-                                    "severity": d.severity.value,
-                                    "code": d.code,
-                                    "message": d.message,
-                                    "repo_path": d.span.repo_path if d.span else None,
-                                    "line": d.span.start_line if d.span else None,
-                                    "missing_dependency": d.missing_dependency,
-                                    "unsupported_feature": d.unsupported_feature,
-                                }
+                                format_diagnostic_record(
+                                    d,
+                                    tu_key=spec.tu_key,
+                                    main_file_path=spec.main_file_path,
+                                    context_key=spec.build_context.context_key,
+                                    parse_run_id=parse_run_id,
+                                    parse_status=payload.parse_status.value,
+                                    reused=False,
+                                    is_inherited=False,
+                                    tu_snapshot_state=(
+                                        "verified_current"
+                                        if payload.parse_status == ParseStatus.PARSED_CLEAN
+                                        else "unverified_current"
+                                    ),
+                                    content_sha256=sha_val,
+                                )
                             )
 
                         tu_results.append(
@@ -488,20 +600,23 @@ def _scan_repository(
                             }
                         )
 
-                        progress.tu_result(payload.parse_status.value,
-                                           Counter(d.severity.value for d in payload.diagnostics), tu_started)
+                        progress.tu_result(
+                            payload.parse_status.value,
+                            Counter(d.severity.value for d in payload.diagnostics),
+                            tu_started,
+                        )
 
                     progress.tu = {}
                 if on_before_publish is not None:
                     on_before_publish(store, gen_id)
 
                 progress.publication_start = progress.clock()
-                progress.emit('publication', 'started')
-                with progress.phase('publication_transaction'):
+                progress.emit("publication", "started")
+                with progress.phase("publication_transaction"):
                     store.publish_generation(gen_id)
             except BaseException:
                 try:
-                    with progress.phase('rollback'):
+                    with progress.phase("rollback"):
                         store.rollback_generation(gen_id)
                 except Exception:
                     pass
@@ -531,6 +646,8 @@ def _scan_repository(
                 "failed_translation_units": failed_count,
                 "tu_results": tu_results,
                 "diagnostics": surfaced_diagnostics,
+                "blocker_summaries": status_after["blocker_summaries"],
+                "diagnostic_summary": status_after["diagnostic_summary"],
                 "warnings": list(imported.warnings),
                 "published_generation": status_after["published_generation"],
             }

@@ -13,10 +13,13 @@ from typing import Any, Iterable
 from . import SCHEMA_VERSION, __version__
 from .discovery import SOURCE_EXTENSIONS, discover_repository_files, resolve_repo_root
 from .models import (
+    BLOCKING_DIAGNOSTIC_SEVERITIES,
     BuildContextSpec,
     CandidateTargetRecord,
     ConditionState,
     DependencyKind,
+    DiagnosticLocationProvenance,
+    DiagnosticLocationQuality,
     DiagnosticRecord,
     DiagnosticSeverity,
     DispatchKind,
@@ -39,6 +42,11 @@ from .models import (
     SymbolOccurrenceRecord,
     TUDependencyRecord,
     TranslationUnitSpec,
+    build_diagnostic_summary,
+    classify_diagnostic,
+    infer_legacy_diagnostic_provenance,
+    is_exact_diagnostic_location,
+    summarize_blocker_diagnostics,
 )
 
 SCHEMA_DDL = """
@@ -284,7 +292,11 @@ CREATE TABLE IF NOT EXISTS diagnostics (
     end_line INTEGER,
     end_col INTEGER,
     missing_dependency TEXT NOT NULL DEFAULT '',
-    unsupported_feature TEXT NOT NULL DEFAULT ''
+    unsupported_feature TEXT NOT NULL DEFAULT '',
+    location_quality TEXT NOT NULL DEFAULT 'unknown',
+    location_provenance TEXT NOT NULL DEFAULT 'unknown',
+    diagnostic_option TEXT NOT NULL DEFAULT '',
+    diagnostic_class TEXT NOT NULL DEFAULT ''
 );
 
 -- Indexes per Section 5.2 of IMPLEMENTATION_PLAN.vi.md
@@ -324,6 +336,103 @@ class IndexStore:
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA journal_mode = WAL;")
         self._conn.execute("PRAGMA synchronous = NORMAL;")
+        self._ensure_diagnostics_columns()
+
+    def _ensure_diagnostics_columns(self) -> None:
+        """Conservatively migrate older diagnostics tables to include provenance and classification columns."""
+        has_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'diagnostics'"
+        ).fetchone()
+        if has_table is None:
+            return
+        cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(diagnostics)").fetchall()
+        }
+        required = (
+            ("location_quality", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("location_provenance", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("diagnostic_option", "TEXT NOT NULL DEFAULT ''"),
+            ("diagnostic_class", "TEXT NOT NULL DEFAULT ''"),
+        )
+        missing = [(name, decl) for name, decl in required if name not in cols]
+        needs_backfill = bool(missing)
+        if not needs_backfill:
+            legacy_row = self._conn.execute(
+                """
+                SELECT 1 FROM diagnostics
+                WHERE diagnostic_class = ''
+                   OR (
+                       location_quality = 'unknown'
+                       AND (
+                           file_version_id IS NULL
+                           OR start_line IS NULL
+                           OR parse_scope = 'config'
+                           OR (byte_start IS NOT NULL AND byte_end IS NOT NULL AND byte_end > byte_start)
+                           OR code IN (
+                               'clang.main_file_missing',
+                               'scanner.main_file_deleted',
+                               'clang.unsupported_flag',
+                               'clang.unsupported_response_file',
+                               'clang.binary_pch_unsupported',
+                               'clang.unsupported_wchar_context',
+                               'clang.source_mutated_during_parse',
+                               'scanner.source_changed_after_parse',
+                               'clang.parse_exception',
+                               'clang.unsupported_encoding'
+                           )
+                       )
+                   )
+                LIMIT 1
+                """
+            ).fetchone()
+            needs_backfill = legacy_row is not None
+        if not missing and not needs_backfill:
+            return
+        with self.atomic_update():
+            for name, decl in missing:
+                self._conn.execute(f"ALTER TABLE diagnostics ADD COLUMN {name} {decl}")
+            rows = self._conn.execute(
+                """
+                SELECT id, file_version_id, severity, code, message, parse_scope,
+                       byte_start, byte_end, start_line, missing_dependency,
+                       unsupported_feature, location_quality, location_provenance,
+                       diagnostic_option, diagnostic_class
+                FROM diagnostics
+                """
+            ).fetchall()
+            for r in rows:
+                has_span = r["file_version_id"] is not None and r["start_line"] is not None
+                qual, prov = infer_legacy_diagnostic_provenance(
+                    code=str(r["code"] or ""),
+                    parse_scope=str(r["parse_scope"] or "tu"),
+                    has_span=has_span,
+                    byte_start=r["byte_start"],
+                    byte_end=r["byte_end"],
+                    location_quality=str(r["location_quality"] or ""),
+                    location_provenance=str(r["location_provenance"] or ""),
+                )
+                cls = str(r["diagnostic_class"] or "") or classify_diagnostic(
+                    code=str(r["code"] or ""),
+                    message=str(r["message"] or ""),
+                    diagnostic_option=str(r["diagnostic_option"] or ""),
+                    severity=str(r["severity"] or ""),
+                    missing_dependency=str(r["missing_dependency"] or ""),
+                    unsupported_feature=str(r["unsupported_feature"] or ""),
+                )
+                if (
+                    qual != str(r["location_quality"] or "")
+                    or prov != str(r["location_provenance"] or "")
+                    or cls != str(r["diagnostic_class"] or "")
+                ):
+                    self._conn.execute(
+                        """
+                        UPDATE diagnostics
+                        SET location_quality = ?, location_provenance = ?, diagnostic_class = ?
+                        WHERE id = ?
+                        """,
+                        (qual, prov, cls, int(r["id"])),
+                    )
 
     @contextmanager
     def atomic_update(self):
@@ -362,6 +471,7 @@ class IndexStore:
         now = _utc_now_iso()
         with self.atomic_update():
             self._conn.executescript(SCHEMA_DDL)
+            self._ensure_diagnostics_columns()
             existing_ver = self._get_meta("schema_version")
             if existing_ver is not None and int(existing_ver) != SCHEMA_VERSION:
                 raise RuntimeError(
@@ -1091,9 +1201,10 @@ class IndexStore:
                     INSERT INTO diagnostics(
                         parse_run_id, file_version_id, severity, code, message,
                         parse_scope, byte_start, byte_end, start_line, start_col,
-                        end_line, end_col, missing_dependency, unsupported_feature
+                        end_line, end_col, missing_dependency, unsupported_feature,
+                        location_quality, location_provenance, diagnostic_option, diagnostic_class
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         parse_run_id,
@@ -1110,6 +1221,10 @@ class IndexStore:
                         diag.span.end_col if diag.span else None,
                         diag.missing_dependency,
                         diag.unsupported_feature,
+                        diag.location_quality,
+                        diag.location_provenance,
+                        diag.diagnostic_option,
+                        diag.diagnostic_class,
                     ),
                 )
 
@@ -1543,6 +1658,272 @@ class IndexStore:
             results.append(item)
         return results
 
+    def query_diagnostics(
+        self,
+        *,
+        generation_id: int | None = None,
+        context_key: str | None = None,
+        tu_key: str | None = None,
+        severity: str | None = None,
+        diagnostic_class: str | None = None,
+        blocking_only: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query persisted per-TU diagnostics for active translation units as of `generation_id` (or published generation)."""
+        self._ensure_diagnostics_columns()
+        try:
+            repo_id = self.get_active_repository_id()
+        except RuntimeError:
+            return []
+
+        target_gen = (
+            generation_id if generation_id is not None else self.get_published_generation_id()
+        )
+        if target_gen is None:
+            return []
+
+        params: list[Any] = [repo_id]
+        clauses = ["p.repository_id = ?", "tu.is_active = 1"]
+        if context_key is not None:
+            clauses.append("bc.context_key = ?")
+            params.append(context_key)
+        if tu_key is not None:
+            clauses.append("tu.tu_key = ?")
+            params.append(tu_key)
+
+        tu_rows = self._conn.execute(
+            f"""
+            SELECT tu.id AS tu_id, tu.tu_key, bc.context_key,
+                   mf.repo_path AS main_repo_path, mf.is_deleted AS main_is_deleted
+            FROM translation_units tu
+            JOIN build_contexts bc ON bc.id = tu.build_context_id
+            JOIN projects p ON p.id = bc.project_id
+            JOIN files mf ON mf.id = tu.main_file_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY bc.context_key, tu.tu_key
+            """,
+            params,
+        ).fetchall()
+
+        sev_filter = severity.strip().lower() if severity else None
+        cls_filter = diagnostic_class.strip().lower() if diagnostic_class else None
+        results: list[dict[str, Any]] = []
+
+        for tu_row in tu_rows:
+            tkey = str(tu_row["tu_key"])
+            ckey = str(tu_row["context_key"])
+            main_rel = str(tu_row["main_repo_path"])
+            tu_id = int(tu_row["tu_id"])
+
+            if bool(tu_row["main_is_deleted"]):
+                sev_val = DiagnosticSeverity.FATAL.value
+                cls_val = classify_diagnostic(
+                    code="scanner.main_file_deleted",
+                    message=f"Main source file '{main_rel}' is missing or deleted.",
+                    severity=sev_val,
+                    missing_dependency=main_rel,
+                )
+                if blocking_only and sev_val not in BLOCKING_DIAGNOSTIC_SEVERITIES:
+                    continue
+                if sev_filter and sev_val != sev_filter:
+                    continue
+                if cls_filter and cls_val != cls_filter:
+                    continue
+                results.append(
+                    {
+                        "id": None,
+                        "parse_run_id": None,
+                        "generation_id": target_gen,
+                        "tu_key": tkey,
+                        "context_key": ckey,
+                        "main_file_path": main_rel,
+                        "parse_status": ParseStatus.FAILED.value,
+                        "reused": False,
+                        "is_inherited": False,
+                        "tu_snapshot_state": "main_file_deleted",
+                        "severity": sev_val,
+                        "code": "scanner.main_file_deleted",
+                        "message": f"Main source file '{main_rel}' is missing or deleted.",
+                        "parse_scope": "tu",
+                        "repo_path": main_rel,
+                        "line": None,
+                        "col": None,
+                        "start_line": None,
+                        "start_col": None,
+                        "end_line": None,
+                        "end_col": None,
+                        "byte_start": None,
+                        "byte_end": None,
+                        "content_sha256": None,
+                        "location_quality": DiagnosticLocationQuality.NONE.value,
+                        "location_provenance": DiagnosticLocationProvenance.MISSING_FILE.value,
+                        "is_exact_location": False,
+                        "diagnostic_option": "",
+                        "diagnostic_class": cls_val,
+                        "missing_dependency": main_rel,
+                        "unsupported_feature": "",
+                    }
+                )
+                if limit is not None and len(results) >= limit:
+                    return results[:limit]
+                continue
+
+            gtr_row = self._conn.execute(
+                """
+                SELECT pr.id AS parse_run_id, pr.generation_id, pr.parse_status
+                FROM generation_tu_runs gtr
+                JOIN parse_runs pr ON pr.id = gtr.parse_run_id
+                WHERE gtr.generation_id = ? AND gtr.translation_unit_id = ?
+                """,
+                (target_gen, tu_id),
+            ).fetchone()
+
+            if gtr_row is not None:
+                run_id = int(gtr_row["parse_run_id"])
+                run_gen_id = int(gtr_row["generation_id"])
+                run_status = str(gtr_row["parse_status"])
+                inherited = run_gen_id != int(target_gen)
+                snap_state = "verified_inherited" if inherited else "verified_current"
+            else:
+                latest_run = self._conn.execute(
+                    """
+                    SELECT pr.id AS parse_run_id, pr.generation_id, pr.parse_status
+                    FROM parse_runs pr
+                    JOIN generations g ON g.id = pr.generation_id
+                    WHERE pr.translation_unit_id = ?
+                      AND pr.generation_id <= ?
+                      AND (g.id = ? OR g.status IN ('published', 'superseded'))
+                      AND g.status != 'rolled_back'
+                    ORDER BY pr.id DESC
+                    LIMIT 1
+                    """,
+                    (tu_id, target_gen, target_gen),
+                ).fetchone()
+                if latest_run is None or str(latest_run["parse_status"]) == ParseStatus.PARSED_CLEAN.value:
+                    continue
+                run_id = int(latest_run["parse_run_id"])
+                run_gen_id = int(latest_run["generation_id"])
+                run_status = str(latest_run["parse_status"])
+                inherited = run_gen_id != int(target_gen)
+                snap_state = "unverified_inherited" if inherited else "unverified_current"
+
+            diag_rows = self._conn.execute(
+                """
+                SELECT d.id, d.parse_run_id, d.file_version_id, d.severity, d.code, d.message,
+                       d.parse_scope, d.byte_start, d.byte_end, d.start_line, d.start_col,
+                       d.end_line, d.end_col, d.missing_dependency, d.unsupported_feature,
+                       d.location_quality, d.location_provenance, d.diagnostic_option, d.diagnostic_class,
+                       f.repo_path, fv.content_sha256
+                FROM diagnostics d
+                LEFT JOIN file_versions fv ON fv.id = d.file_version_id
+                LEFT JOIN files f ON f.id = fv.file_id
+                WHERE d.parse_run_id = ?
+                ORDER BY d.id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+
+            for d in diag_rows:
+                sev_val = str(d["severity"] or "").strip().lower()
+                if blocking_only and sev_val not in BLOCKING_DIAGNOSTIC_SEVERITIES:
+                    continue
+                if sev_filter and sev_val != sev_filter:
+                    continue
+
+                repo_path = str(d["repo_path"]) if d["repo_path"] is not None else None
+                start_line = int(d["start_line"]) if d["start_line"] is not None else None
+                start_col = int(d["start_col"]) if d["start_col"] is not None else None
+                end_line = int(d["end_line"]) if d["end_line"] is not None else None
+                end_col = int(d["end_col"]) if d["end_col"] is not None else None
+                byte_start = int(d["byte_start"]) if d["byte_start"] is not None else None
+                byte_end = int(d["byte_end"]) if d["byte_end"] is not None else None
+                has_span = repo_path is not None and start_line is not None
+
+                loc_qual, loc_prov = infer_legacy_diagnostic_provenance(
+                    code=str(d["code"] or ""),
+                    parse_scope=str(d["parse_scope"] or "tu"),
+                    has_span=has_span,
+                    byte_start=byte_start,
+                    byte_end=byte_end,
+                    location_quality=str(d["location_quality"] or ""),
+                    location_provenance=str(d["location_provenance"] or ""),
+                )
+                is_exact = is_exact_diagnostic_location(
+                    has_span=has_span,
+                    repo_path=repo_path,
+                    line=start_line,
+                    location_quality=loc_qual,
+                    location_provenance=loc_prov,
+                )
+                diag_opt = str(d["diagnostic_option"] or "")
+                diag_cls = str(d["diagnostic_class"] or "") or classify_diagnostic(
+                    code=str(d["code"] or ""),
+                    message=str(d["message"] or ""),
+                    diagnostic_option=diag_opt,
+                    severity=sev_val,
+                    missing_dependency=str(d["missing_dependency"] or ""),
+                    unsupported_feature=str(d["unsupported_feature"] or ""),
+                )
+                if cls_filter and diag_cls != cls_filter:
+                    continue
+
+                results.append(
+                    {
+                        "id": int(d["id"]),
+                        "parse_run_id": run_id,
+                        "generation_id": run_gen_id,
+                        "tu_key": tkey,
+                        "context_key": ckey,
+                        "main_file_path": main_rel,
+                        "parse_status": run_status,
+                        "reused": inherited,
+                        "is_inherited": inherited,
+                        "tu_snapshot_state": snap_state,
+                        "severity": sev_val,
+                        "code": str(d["code"] or ""),
+                        "message": str(d["message"] or ""),
+                        "parse_scope": str(d["parse_scope"] or "tu"),
+                        "repo_path": repo_path,
+                        "line": start_line,
+                        "col": start_col,
+                        "start_line": start_line,
+                        "start_col": start_col,
+                        "end_line": end_line,
+                        "end_col": end_col,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
+                        "file_version_id": int(d["file_version_id"]) if d["file_version_id"] is not None else None,
+                        "content_sha256": str(d["content_sha256"]) if d["content_sha256"] is not None else None,
+                        "location_quality": loc_qual,
+                        "location_provenance": loc_prov,
+                        "is_exact_location": is_exact,
+                        "diagnostic_option": diag_opt,
+                        "diagnostic_class": diag_cls,
+                        "missing_dependency": str(d["missing_dependency"] or ""),
+                        "unsupported_feature": str(d["unsupported_feature"] or ""),
+                    }
+                )
+                if limit is not None and len(results) >= limit:
+                    return results[:limit]
+
+        return results
+
+    def get_diagnostic_summary(
+        self,
+        *,
+        generation_id: int | None = None,
+        context_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Return grouped blocker summaries and diagnostic breakdown for `generation_id` (or published generation)."""
+        records = self.query_diagnostics(generation_id=generation_id, context_key=context_key)
+        blockers = summarize_blocker_diagnostics(records, blocking_only=True)
+        summary = build_diagnostic_summary(records, blockers)
+        return {
+            "diagnostic_summary": summary,
+            "blocker_summaries": blockers,
+            "diagnostics": records,
+        }
+
     def get_status_summary(self) -> dict[str, Any]:
         """Return a structured status summary of the database, files, contexts, TUs, and generations."""
         repo_id = self.get_active_repository_id()
@@ -1586,6 +1967,8 @@ class IndexStore:
                     "verified_tu_runs": int(active_runs_cnt["cnt"]),
                 }
 
+        diag_bundle = self.get_diagnostic_summary(generation_id=pub_gen_id)
+
         return {
             "schema_version": int(self._get_meta("schema_version") or SCHEMA_VERSION),
             "tool_version": self._get_meta("tool_version") or __version__,
@@ -1599,4 +1982,6 @@ class IndexStore:
             "build_contexts": int(contexts_cnt["cnt"]),
             "active_translation_units": int(active_tus["cnt"]),
             "published_generation": pub_gen_info,
+            "diagnostic_summary": diag_bundle["diagnostic_summary"],
+            "blocker_summaries": diag_bundle["blocker_summaries"],
         }

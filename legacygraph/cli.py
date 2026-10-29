@@ -352,6 +352,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
             )
         else:
             print("Published generation:      None")
+        if summary.get("blocker_summaries"):
+            print(f"Blocker groups:            {len(summary['blocker_summaries'])}")
         if args.check_invalidated:
             inv = summary["invalidated_translation_units"]
             print(f"Invalidated / pending TUs: {len(inv)}")
@@ -394,6 +396,8 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         )
         if summary["diagnostics"]:
             print(f"Diagnostics surfaced:       {len(summary['diagnostics'])}")
+        if summary.get("blocker_summaries"):
+            print(f"Blocker groups:             {len(summary['blocker_summaries'])}")
     return 3 if summary["failed_translation_units"] else 0
 
 

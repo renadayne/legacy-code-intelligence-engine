@@ -174,7 +174,13 @@ class ParserEncodingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as outside:
             header = Path(outside) / 'external.h'
             header.write_bytes('const wchar_t* external_text=L"あ";\n'.encode('cp932'))
-            (self.root / 'escape.h').symlink_to(header)
+            (self.root / 'main.cpp').write_text(f'#include "{header.as_posix()}"\nint run();\n')
+            ext_res = self.parser().parse(self.spec)
+            self.assertEqual(ext_res.parse_status, ParseStatus.PARSED_WITH_ERRORS)
+            self.assertFalse(ext_res.entities)
+            try: (self.root / 'escape.h').symlink_to(header)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest('Symlink capability unavailable; containment scenario unverified: ' + str(exc))
             (self.root / 'main.cpp').write_text('#include "escape.h"\nint run();\n')
             parser = self.parser()
             result = parser.parse(self.spec)

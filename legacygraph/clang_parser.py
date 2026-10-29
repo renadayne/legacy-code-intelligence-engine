@@ -15,6 +15,8 @@ from .parser_input import SourceBuffer, encoding_name, policy_version
 from .models import (
     ConditionState,
     DependencyKind,
+    DiagnosticLocationProvenance,
+    DiagnosticLocationQuality,
     DiagnosticRecord,
     DiagnosticSeverity,
     DispatchKind,
@@ -726,6 +728,9 @@ class ClangParser:
             diagnostics: list[DiagnosticRecord] = list(config_diags)
             has_error_or_fatal = False
             has_incomplete_deps = any(d.is_missing for d in forced_deps)
+            missing_forced_headers = {
+                fd.missing_include_text for fd in forced_deps if fd.is_missing and fd.missing_include_text
+            }
 
             for d in tu.diagnostics:
                 sev_num = int(d.severity)
@@ -747,10 +752,22 @@ class ClangParser:
                     missing_dep = m_inc.group(1)
                     has_incomplete_deps = True
 
-                d_span = self._diagnostic_span(d, pre_bytes_by_rel, main_rel, main_default_span)
+                diag_option = str(getattr(d, "option", "") or "").strip()
+                d_span, loc_quality, loc_provenance = self._resolve_diagnostic_location(
+                    d,
+                    pre_bytes_by_rel,
+                    main_rel,
+                    main_default_span,
+                    missing_dep=missing_dep,
+                    missing_forced_headers=missing_forced_headers,
+                )
                 if missing_dep:
                     inc_from = d_span.repo_path if d_span else main_rel
-                    inc_line = d_span.start_line if d_span else None
+                    inc_line = (
+                        d_span.start_line
+                        if (d_span and loc_quality == DiagnosticLocationQuality.EXACT.value)
+                        else None
+                    )
                     mrec = TUDependencyRecord(
                         repo_path="",
                         dependency_kind=DependencyKind.DIRECT_INCLUDE,
@@ -778,6 +795,9 @@ class ClangParser:
                         span=d_span,
                         parse_scope="tu",
                         missing_dependency=missing_dep,
+                        location_quality=loc_quality,
+                        location_provenance=loc_provenance,
+                        diagnostic_option=diag_option,
                     )
                 )
 
@@ -1896,6 +1916,102 @@ class ClangParser:
         end_b = starts[idx + 1] if idx + 1 < len(starts) else len(raw_bytes)
         end_line, end_col = buffer.position(end_b)
         return SourceSpan(repo_path, start_b, end_b, idx + 1, 1, end_line, end_col)
+
+    def _resolve_diagnostic_location(
+        self,
+        diag: Any,
+        pre_bytes_by_rel: dict[str, bytes],
+        main_rel: str,
+        fallback: SourceSpan,
+        *,
+        missing_dep: str = "",
+        missing_forced_headers: set[str] | None = None,
+    ) -> tuple[SourceSpan, str, str]:
+        loc = getattr(diag, "location", None)
+        loc_file = getattr(loc, "file", None) if loc is not None else None
+        if loc is None or loc_file is None:
+            provenance = (
+                DiagnosticLocationProvenance.MISSING_FILE.value
+                if missing_dep
+                else DiagnosticLocationProvenance.MISSING_LOCATION.value
+            )
+            return fallback, DiagnosticLocationQuality.FALLBACK.value, provenance
+
+        raw_name = str(getattr(loc_file, "name", "") or "").strip()
+        if not raw_name or (raw_name.startswith("<") and raw_name.endswith(">")):
+            provenance = (
+                DiagnosticLocationProvenance.MISSING_FILE.value
+                if missing_dep
+                else DiagnosticLocationProvenance.MISSING_LOCATION.value
+            )
+            return fallback, DiagnosticLocationQuality.FALLBACK.value, provenance
+
+        if (
+            missing_dep
+            and missing_forced_headers
+            and int(getattr(loc, "offset", 0) or 0) == 0
+            and (
+                missing_dep in missing_forced_headers
+                or any(fh.endswith(missing_dep) for fh in missing_forced_headers)
+            )
+        ):
+            return (
+                fallback,
+                DiagnosticLocationQuality.FALLBACK.value,
+                DiagnosticLocationProvenance.MISSING_FILE.value,
+            )
+
+        rel_p = self._try_repo_relative(raw_name)
+        if rel_p is not None:
+            raw_b = pre_bytes_by_rel.get(rel_p)
+            if raw_b is None:
+                try:
+                    p_abs, _ = ensure_contained_path(
+                        self.repo_root, rel_p, allow_nonexistent=False
+                    )
+                    raw_b = p_abs.read_bytes()
+                    pre_bytes_by_rel[rel_p] = raw_b
+                except Exception:
+                    return (
+                        fallback,
+                        DiagnosticLocationQuality.FALLBACK.value,
+                        DiagnosticLocationProvenance.MISSING_FILE.value,
+                    )
+            b_off = self._original_offset(rel_p, int(loc.offset))
+            buffer = self._source_buffers.get(rel_p)
+            if buffer is not None:
+                line, col = buffer.position(b_off)
+            else:
+                line, col = max(1, int(loc.line)), max(1, int(loc.column))
+            return (
+                SourceSpan(
+                    repo_path=rel_p,
+                    byte_start=b_off,
+                    byte_end=b_off,
+                    start_line=line,
+                    start_col=col,
+                    end_line=line,
+                    end_col=col,
+                ),
+                DiagnosticLocationQuality.EXACT.value,
+                DiagnosticLocationProvenance.CONTAINED_FILE.value,
+            )
+
+        try:
+            cand = Path(raw_name)
+            if not cand.is_absolute():
+                cand = self.repo_root / cand
+            resolved = cand.resolve(strict=True)
+            exists_outside = resolved.is_file()
+        except Exception:
+            exists_outside = False
+
+        provenance = (
+            DiagnosticLocationProvenance.EXTERNAL_FILE.value
+            if exists_outside
+            else DiagnosticLocationProvenance.MISSING_FILE.value
+        )
+        return fallback, DiagnosticLocationQuality.FALLBACK.value, provenance
 
     def _diagnostic_span(
         self,

@@ -11,7 +11,14 @@ from typing import Any, Iterable, Iterator
 
 from .discovery import PathContainmentError, detect_encoding_and_decode, ensure_contained_path
 from .index import IndexStore
-from .models import ConditionState, OccurrenceKind, RelationKind, ResolutionStatus
+from .models import (
+    ConditionState,
+    OccurrenceKind,
+    RelationKind,
+    ResolutionStatus,
+    build_diagnostic_summary,
+    summarize_blocker_diagnostics,
+)
 
 MAX_SEARCH_LIMIT = 500
 MAX_SEARCH_OFFSET = 100_000
@@ -503,6 +510,9 @@ class QueryService:
             for r in rows:
                 ctx_key = str(r["context_key"])
                 snap, _, _ = self._get_snapshot_and_context(ctx_key)
+                diag_bundle = self.store.get_diagnostic_summary(
+                    generation_id=snap["generation_id"], context_key=ctx_key
+                )
                 result.append({
                     "id": int(r["id"]), "context_key": ctx_key,
                     "project_name": str(r["project_name"]), "target_name": str(r["target_name"]),
@@ -525,6 +535,9 @@ class QueryService:
                     "incomplete_tu_runs": snap["incomplete_tu_runs"],
                     "unindexed_active_tus": snap["unindexed_active_tus"],
                     "incomplete": snap["incomplete"], "is_complete": snap["is_complete"], "generation": snap,
+                    "blocker_group_count": diag_bundle["diagnostic_summary"]["blocker_group_count"],
+                    "blocking_diagnostic_records": diag_bundle["diagnostic_summary"]["blocking_diagnostic_records"],
+                    "diagnostic_summary": diag_bundle["diagnostic_summary"],
                 })
             return result
 
@@ -1178,4 +1191,60 @@ class QueryService:
                 "line_count": len(span_lines), "truncated": truncated,
                 "truncation_reason": "max_lines" if truncated else None, "omitted_lines": omitted_lines,
                 "content": content_text, "snippet": content_text,
+            }
+
+    def diagnostics(
+        self,
+        context_key: str | None = None,
+        *,
+        tu_key: str | None = None,
+        severity: str | None = None,
+        diagnostic_class: str | None = None,
+        blocking_only: bool = False,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Return persisted per-TU diagnostic records and grouped blocker summaries for the published snapshot."""
+        limit = _validate_int_bound("limit", limit, 1, MAX_NEIGHBORS_LIMIT)
+        with self._read_transaction():
+            snapshot, gen_id, _ = self._get_snapshot_and_context(context_key)
+            all_records = self.store.query_diagnostics(
+                generation_id=gen_id,
+                context_key=context_key,
+                tu_key=tu_key,
+                severity=severity,
+                diagnostic_class=diagnostic_class,
+                blocking_only=blocking_only,
+            )
+            all_blockers = summarize_blocker_diagnostics(
+                all_records,
+                blocking_only=True,
+                max_affected_tus=min(limit, 100),
+            )
+            summary = build_diagnostic_summary(all_records, all_blockers)
+            diagnostics_truncated = len(all_records) > limit
+            blocker_summaries_truncated = len(all_blockers) > limit
+            items = all_records[:limit]
+            returned_blockers = all_blockers[:limit]
+            any_tu_truncated = any(bool(b.get("affected_tus_truncated")) for b in returned_blockers)
+            truncated = diagnostics_truncated or blocker_summaries_truncated or any_tu_truncated
+            return {
+                "generation": snapshot,
+                "context_key": context_key,
+                "tu_key": tu_key,
+                "severity": severity,
+                "diagnostic_class": diagnostic_class,
+                "blocking_only": bool(blocking_only),
+                "limit": limit,
+                "total": len(all_records),
+                "returned_diagnostics": len(items),
+                "diagnostics_truncated": diagnostics_truncated,
+                "total_blocker_summaries": len(all_blockers),
+                "returned_blocker_summaries": len(returned_blockers),
+                "blocker_summaries_truncated": blocker_summaries_truncated,
+                "truncated": truncated,
+                "incomplete": snapshot["incomplete"],
+                "diagnostic_summary": summary,
+                "blocker_summaries": returned_blockers,
+                "diagnostics": items,
+                "items": items,
             }
