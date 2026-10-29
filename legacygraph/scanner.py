@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
+from .progress import Progress
 from typing import Any, Callable, Iterable
 
 from .build_context import load_build_manifest
@@ -142,6 +145,45 @@ def scan_repository(
     parser_version: str = CLANG_PARSER_VERSION,
     mfc_rule_version: str = DEFAULT_MFC_RULE_VERSION,
     on_before_publish: Callable[[IndexStore, int], None] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    clock: Callable[[], float] = perf_counter,
+) -> dict[str, Any]:
+    """Scan transactionally; optional privacy-safe events never change results."""
+    progress = Progress(on_event, clock)
+    progress.emit('scan', 'started')
+    try:
+        result = _scan_repository(
+            repo_root, db_path, manifest_path, force=force, source_revision=source_revision,
+            exclude_dirs=exclude_dirs, preferred_legacy_encoding=preferred_legacy_encoding,
+            parser=parser, parser_input_policy=parser_input_policy, parser_version=parser_version,
+            mfc_rule_version=mfc_rule_version, on_before_publish=on_before_publish,
+            progress=progress,
+        )
+    except BaseException as exc:
+        progress.interrupted('cancelled' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed')
+        raise
+    if not result['noop']:
+        progress.emit('publication', 'finished', committed=True,
+                      elapsed_s=clock()-progress.publication_start)
+    progress.complete(result)
+    return result
+
+
+def _scan_repository(
+    repo_root: str | Path,
+    db_path: str | Path,
+    manifest_path: str | Path,
+    *,
+    force: bool = False,
+    source_revision: str = "",
+    exclude_dirs: Iterable[str] = (),
+    preferred_legacy_encoding: str = "cp1252",
+    parser: ClangParser | None = None,
+    parser_input_policy: str = "utf8-overlay",
+    parser_version: str = CLANG_PARSER_VERSION,
+    mfc_rule_version: str = DEFAULT_MFC_RULE_VERSION,
+    on_before_publish: Callable[[IndexStore, int], None] | None = None,
+    progress: Progress,
 ) -> dict[str, Any]:
     """Run incremental or full semantic indexing for a repository and atomically publish a verified generation.
 
@@ -178,13 +220,15 @@ def scan_repository(
     except ValueError:
         pass
 
-    discovery = discover_repository_files(
-        canonical_root,
-        output_paths_to_exclude=output_exclusions,
-        extra_excluded_dir_names=exclude_dirs,
-        preferred_legacy_encoding=preferred_legacy_encoding,
-    )
-    imported = load_build_manifest(canonical_root, resolved_manifest)
+    with progress.phase("discovery"):
+        discovery = discover_repository_files(
+            canonical_root,
+            output_paths_to_exclude=output_exclusions,
+            extra_excluded_dir_names=exclude_dirs,
+            preferred_legacy_encoding=preferred_legacy_encoding,
+        )
+    with progress.phase("manifest_import"):
+        imported = load_build_manifest(canonical_root, resolved_manifest)
 
     # Also inspect any main source files or forced includes referenced by the manifest that might have non-default extensions
     discovered_map: dict[str, FileInventoryRecord] = {f.repo_path: f for f in discovery.files}
@@ -203,62 +247,69 @@ def scan_repository(
     with IndexStore(resolved_db) as store:
         store.initialize_schema(canonical_root, source_revision=source_revision)
         with store.atomic_update():
-            for rec in _get_tracked_dependency_files(
-                store, canonical_root, preferred_legacy_encoding=preferred_legacy_encoding
-            ):
-                if rec.repo_path not in discovered_map:
-                    discovered_map[rec.repo_path] = rec
-            sync_summary = store.sync_file_inventory(
-                discovered_map.values(), mark_missing_deleted=True
-            )
+            with progress.phase("inventory_sync"):
+                for rec in _get_tracked_dependency_files(
+                    store, canonical_root, preferred_legacy_encoding=preferred_legacy_encoding
+                ):
+                    if rec.repo_path not in discovered_map:
+                        discovered_map[rec.repo_path] = rec
+                sync_summary = store.sync_file_inventory(
+                    discovered_map.values(), mark_missing_deleted=True
+                )
 
-            for ctx in imported.contexts:
-                store.register_build_context(ctx)
-            active_specs_by_key: dict[str, TranslationUnitSpec] = {
-                spec.tu_key: spec for spec in imported.translation_units
-            }
-            store.register_translation_units(
-                imported.translation_units,
-                deactivate_unlisted_for_contexts=False,
-            )
-            deactivated_tu_keys = _deactivate_unlisted_translation_units(
-                store, set(active_specs_by_key.keys())
-            )
+                for ctx in imported.contexts:
+                    store.register_build_context(ctx)
+                active_specs_by_key: dict[str, TranslationUnitSpec] = {
+                    spec.tu_key: spec for spec in imported.translation_units
+                }
+                store.register_translation_units(
+                    imported.translation_units,
+                    deactivate_unlisted_for_contexts=False,
+                )
+                deactivated_tu_keys = _deactivate_unlisted_translation_units(
+                    store, set(active_specs_by_key.keys())
+                )
 
             eff_parser_version = active_parser.parser_version
             eff_mfc_version = parser.mfc_rule_version if parser is not None else mfc_rule_version
 
-            invalidated_items = store.compute_invalidated_translation_units(
-                parser_version=eff_parser_version,
-                mfc_rule_version=eff_mfc_version,
-            )
-            invalidated_by_key = {item["tu_key"]: item for item in invalidated_items}
+            with progress.phase("invalidation"):
+                invalidated_items = store.compute_invalidated_translation_units(
+                    parser_version=eff_parser_version,
+                    mfc_rule_version=eff_mfc_version,
+                )
+                invalidated_by_key = {item["tu_key"]: item for item in invalidated_items}
 
-            # A newly added header can shadow an unchanged consumed header in
-            # an earlier include directory. Reverse dependency hashes alone
-            # cannot detect that change in include resolution.
-            added_headers = [path for path in sync_summary["added"]
-                             if discovered_map[path].file_role in ("header", "inline_header")]
-            if added_headers:
-                for key, spec in active_specs_by_key.items():
-                    invalidated_by_key.setdefault(key, {
-                        "tu_key": key, "context_key": spec.build_context.context_key,
-                        "main_repo_path": spec.main_file_path,
-                        "reasons": ["include_search_changed:new_header"],
-                    })
-                invalidated_items = [invalidated_by_key[key] for key in sorted(invalidated_by_key)]
+                # A newly added header can shadow an unchanged consumed header in
+                # an earlier include directory. Reverse dependency hashes alone
+                # cannot detect that change in include resolution.
+                added_headers = [path for path in sync_summary["added"]
+                                 if discovered_map[path].file_role in ("header", "inline_header")]
+                if added_headers:
+                    for key, spec in active_specs_by_key.items():
+                        invalidated_by_key.setdefault(key, {
+                            "tu_key": key, "context_key": spec.build_context.context_key,
+                            "main_repo_path": spec.main_file_path,
+                            "reasons": ["include_search_changed:new_header"],
+                        })
+                    invalidated_items = [invalidated_by_key[key] for key in sorted(invalidated_by_key)]
 
-            prev_published_id = store.get_published_generation_id()
-            if force:
-                tus_to_parse = [
-                    spec for _, spec in sorted(active_specs_by_key.items(), key=lambda kv: kv[0])
-                ]
-            else:
-                tus_to_parse = [
-                    active_specs_by_key[tkey]
-                    for tkey in sorted(invalidated_by_key.keys())
-                    if tkey in active_specs_by_key
-                ]
+                prev_published_id = store.get_published_generation_id()
+                if force:
+                    tus_to_parse = [
+                        spec for _, spec in sorted(active_specs_by_key.items(), key=lambda kv: kv[0])
+                    ]
+                else:
+                    tus_to_parse = [
+                        active_specs_by_key[tkey]
+                        for tkey in sorted(invalidated_by_key.keys())
+                        if tkey in active_specs_by_key
+                    ]
+
+            progress.emit('schedule', 'finished', requested=len(active_specs_by_key),
+                          selected=len(tus_to_parse), reused=len(active_specs_by_key)-len(tus_to_parse),
+                          deleted=sum('main_file_deleted' in item['reasons'] for item in invalidated_items),
+                          deactivated=len(deactivated_tu_keys))
 
             # Incremental no-op: if nothing is invalidated, no TUs were deactivated, no files were deleted,
             # and a published generation already exists with matching versions, skip creating a redundant generation.
@@ -296,131 +347,162 @@ def scan_repository(
                     "published_generation": status_after["published_generation"],
                 }
 
-            gen_id = store.begin_generation(
-                parser_version=eff_parser_version,
-                mfc_rule_version=eff_mfc_version,
-                notes="scan_repository",
-                inherit_from_published=True,
-            )
+            with progress.phase('generation_creation'):
+                gen_id = store.begin_generation(
+                    parser_version=eff_parser_version,
+                    mfc_rule_version=eff_mfc_version,
+                    notes="scan_repository",
+                    inherit_from_published=True,
+                )
             try:
                 tu_results: list[dict[str, Any]] = []
                 surfaced_diagnostics: list[dict[str, Any]] = []
                 clean_count = 0
                 failed_count = 0
 
-                for spec in tus_to_parse:
-                    inv_info = invalidated_by_key.get(spec.tu_key)
-                    reasons = inv_info["reasons"] if inv_info else (["forced"] if force else [])
+                with progress.phase('tu_processing'):
+                    for ordinal, spec in enumerate(tus_to_parse, 1):
+                        progress.tu = dict(tu=ordinal, scheduled=len(tus_to_parse))
+                        tu_started = progress.clock()
+                        progress.emit('tu', 'started')
+                        inv_info = invalidated_by_key.get(spec.tu_key)
+                        reasons = inv_info["reasons"] if inv_info else (["forced"] if force else [])
 
-                    if "main_file_deleted" in reasons:
-                        store.retract_translation_unit_from_generation(gen_id, spec.tu_key)
-                        failed_count += 1
-                        diag_entry = {
-                            "tu_key": spec.tu_key,
-                            "main_file_path": spec.main_file_path,
-                            "severity": "fatal",
-                            "code": "scanner.main_file_deleted",
-                            "message": f"Main source file '{spec.main_file_path}' is missing or deleted.",
-                            "repo_path": spec.main_file_path,
-                            "line": None,
-                            "missing_dependency": spec.main_file_path,
-                            "unsupported_feature": "",
-                        }
-                        surfaced_diagnostics.append(diag_entry)
+                        if "main_file_deleted" in reasons:
+                            with progress.phase('persistence'):
+                                store.retract_translation_unit_from_generation(gen_id, spec.tu_key)
+                            failed_count += 1
+                            diag_entry = {
+                                "tu_key": spec.tu_key,
+                                "main_file_path": spec.main_file_path,
+                                "severity": "fatal",
+                                "code": "scanner.main_file_deleted",
+                                "message": f"Main source file '{spec.main_file_path}' is missing or deleted.",
+                                "repo_path": spec.main_file_path,
+                                "line": None,
+                                "missing_dependency": spec.main_file_path,
+                                "unsupported_feature": "",
+                            }
+                            surfaced_diagnostics.append(diag_entry)
+                            tu_results.append(
+                                {
+                                    "tu_key": spec.tu_key,
+                                    "context_key": spec.build_context.context_key,
+                                    "main_file_path": spec.main_file_path,
+                                    "parse_status": ParseStatus.FAILED.value,
+                                    "reasons": reasons,
+                                    "entity_count": 0,
+                                    "occurrence_count": 0,
+                                    "relation_count": 0,
+                                    "dependency_count": 0,
+                                    "diagnostic_count": 1,
+                                }
+                            )
+                            progress.tu_result(ParseStatus.FAILED.value, {'fatal': 1}, tu_started)
+                            continue
+
+                        with progress.phase('parse'):
+                            # Only our exact parser implementation opts into private
+                            # instrumentation. Custom parse(spec) signatures stay intact.
+                            if type(active_parser) is ClangParser:
+                                previous = active_parser._progress
+                                active_parser._progress = progress
+                                try:
+                                    payload = active_parser.parse(spec)
+                                finally:
+                                    active_parser._progress = previous
+                            else:
+                                progress.native_instrumentation_complete = False
+                                payload = active_parser.parse(spec)
+                        with progress.phase("augmentation"):
+                            if payload.parse_status == ParseStatus.PARSED_CLEAN:
+                                payload = augment_payload(
+                                    payload, spec, canonical_root,
+                                    active_macro_offsets=getattr(active_parser, "last_macro_offsets", None),
+                                    preferred_legacy_encoding=preferred_legacy_encoding,
+                                )
+                        with progress.phase("consumed_inventory_sync"):
+                            extra_synced = _ensure_consumed_files_synced(
+                                store,
+                                canonical_root,
+                                payload,
+                                preferred_legacy_encoding=preferred_legacy_encoding,
+                            )
+                            for p in extra_synced:
+                                if p not in sync_summary["added"] and p not in sync_summary["unchanged"]:
+                                    sync_summary["added"].append(p)
+
+                        with progress.phase("source_validation"):
+                            changed_sources = []
+                            for relative, expected_hash in getattr(active_parser, "last_file_hashes", {}).items():
+                                try:
+                                    source_path, _ = ensure_contained_path(canonical_root, relative)
+                                    if hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash:
+                                        changed_sources.append(relative)
+                                except (OSError, ValueError):
+                                    changed_sources.append(relative)
+                            if changed_sources:
+                                payload = replace(
+                                    payload, parse_status=ParseStatus.STALE, entities=(), occurrences=(),
+                                    observations=(), relations=(), has_incomplete_dependencies=True,
+                                    diagnostics=payload.diagnostics + (DiagnosticRecord(
+                                        DiagnosticSeverity.ERROR, "scanner.source_changed_after_parse",
+                                        "Source changed before persistence: " + ", ".join(sorted(changed_sources)),
+                                    ),),
+                                )
+                        with progress.phase("persistence"):
+                            parse_run_id = store.record_parse_run(gen_id, payload)
+                        if payload.parse_status == ParseStatus.PARSED_CLEAN:
+                            clean_count += 1
+                        else:
+                            failed_count += 1
+
+                        for d in payload.diagnostics:
+                            surfaced_diagnostics.append(
+                                {
+                                    "tu_key": spec.tu_key,
+                                    "main_file_path": spec.main_file_path,
+                                    "severity": d.severity.value,
+                                    "code": d.code,
+                                    "message": d.message,
+                                    "repo_path": d.span.repo_path if d.span else None,
+                                    "line": d.span.start_line if d.span else None,
+                                    "missing_dependency": d.missing_dependency,
+                                    "unsupported_feature": d.unsupported_feature,
+                                }
+                            )
+
                         tu_results.append(
                             {
                                 "tu_key": spec.tu_key,
                                 "context_key": spec.build_context.context_key,
                                 "main_file_path": spec.main_file_path,
-                                "parse_status": ParseStatus.FAILED.value,
+                                "parse_run_id": parse_run_id,
+                                "parse_status": payload.parse_status.value,
                                 "reasons": reasons,
-                                "entity_count": 0,
-                                "occurrence_count": 0,
-                                "relation_count": 0,
-                                "dependency_count": 0,
-                                "diagnostic_count": 1,
-                            }
-                        )
-                        continue
-
-                    payload = active_parser.parse(spec)
-                    if payload.parse_status == ParseStatus.PARSED_CLEAN:
-                        payload = augment_payload(
-                            payload, spec, canonical_root,
-                            active_macro_offsets=getattr(active_parser, "last_macro_offsets", None),
-                            preferred_legacy_encoding=preferred_legacy_encoding,
-                        )
-                    extra_synced = _ensure_consumed_files_synced(
-                        store,
-                        canonical_root,
-                        payload,
-                        preferred_legacy_encoding=preferred_legacy_encoding,
-                    )
-                    for p in extra_synced:
-                        if p not in sync_summary["added"] and p not in sync_summary["unchanged"]:
-                            sync_summary["added"].append(p)
-
-                    changed_sources = []
-                    for relative, expected_hash in getattr(active_parser, "last_file_hashes", {}).items():
-                        try:
-                            source_path, _ = ensure_contained_path(canonical_root, relative)
-                            if hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash:
-                                changed_sources.append(relative)
-                        except (OSError, ValueError):
-                            changed_sources.append(relative)
-                    if changed_sources:
-                        payload = replace(
-                            payload, parse_status=ParseStatus.STALE, entities=(), occurrences=(),
-                            observations=(), relations=(), has_incomplete_dependencies=True,
-                            diagnostics=payload.diagnostics + (DiagnosticRecord(
-                                DiagnosticSeverity.ERROR, "scanner.source_changed_after_parse",
-                                "Source changed before persistence: " + ", ".join(sorted(changed_sources)),
-                            ),),
-                        )
-                    parse_run_id = store.record_parse_run(gen_id, payload)
-                    if payload.parse_status == ParseStatus.PARSED_CLEAN:
-                        clean_count += 1
-                    else:
-                        failed_count += 1
-
-                    for d in payload.diagnostics:
-                        surfaced_diagnostics.append(
-                            {
-                                "tu_key": spec.tu_key,
-                                "main_file_path": spec.main_file_path,
-                                "severity": d.severity.value,
-                                "code": d.code,
-                                "message": d.message,
-                                "repo_path": d.span.repo_path if d.span else None,
-                                "line": d.span.start_line if d.span else None,
-                                "missing_dependency": d.missing_dependency,
-                                "unsupported_feature": d.unsupported_feature,
+                                "entity_count": len(payload.entities),
+                                "occurrence_count": len(payload.occurrences),
+                                "relation_count": len(payload.relations),
+                                "dependency_count": len(payload.dependencies),
+                                "diagnostic_count": len(payload.diagnostics),
                             }
                         )
 
-                    tu_results.append(
-                        {
-                            "tu_key": spec.tu_key,
-                            "context_key": spec.build_context.context_key,
-                            "main_file_path": spec.main_file_path,
-                            "parse_run_id": parse_run_id,
-                            "parse_status": payload.parse_status.value,
-                            "reasons": reasons,
-                            "entity_count": len(payload.entities),
-                            "occurrence_count": len(payload.occurrences),
-                            "relation_count": len(payload.relations),
-                            "dependency_count": len(payload.dependencies),
-                            "diagnostic_count": len(payload.diagnostics),
-                        }
-                    )
+                        progress.tu_result(payload.parse_status.value,
+                                           Counter(d.severity.value for d in payload.diagnostics), tu_started)
 
+                    progress.tu = {}
                 if on_before_publish is not None:
                     on_before_publish(store, gen_id)
 
-                store.publish_generation(gen_id)
-            except Exception:
+                progress.publication_start = progress.clock()
+                progress.emit('publication', 'started')
+                with progress.phase('publication_transaction'):
+                    store.publish_generation(gen_id)
+            except BaseException:
                 try:
-                    store.rollback_generation(gen_id)
+                    with progress.phase('rollback'):
+                        store.rollback_generation(gen_id)
                 except Exception:
                     pass
                 raise

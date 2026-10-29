@@ -88,6 +88,15 @@ actually consumed by libclang rather than later disk contents.
   those performance/coverage claims. Path deadlines are checked between query
   operations, so an individual SQLite operation may exceed the requested deadline.
 
+## Scan progress
+
+Add `--progress` to a new scan invocation for flushed, privacy-safe phase/TU
+progress on stderr. With `--json`, stdout remains one final JSON document.
+For example, append `--json --progress > scan.json 2> scan-progress.log`.
+Progress distinguishes compiler errors, stale TUs and partial published coverage;
+it does not fix compiler compatibility or promise a speedup. Existing scans are
+not affected. See [progress events, timings and limitations](docs/SCAN_PROGRESS.md).
+
 ## CLI Usage
 
 Run via `python -m legacygraph`:

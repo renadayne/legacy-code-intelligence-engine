@@ -22,7 +22,9 @@ from legacygraph.scanner import scan_repository
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--functions', type=int, default=500)
-    count = ap.parse_args().functions
+    ap.add_argument('--progress-overhead', action='store_true', help='Measure paired forced synthetic scans with/without flushed progress.')
+    arguments = ap.parse_args()
+    count = arguments.functions
     if not 1 <= count <= 10000:
         ap.error('--functions must be 1..10000')
     with tempfile.TemporaryDirectory(prefix='legacygraph-synthetic-') as directory:
@@ -70,7 +72,31 @@ def main():
         warm = scan_repository(root,db,manifest,preferred_legacy_encoding='cp932')
         warm_seconds = perf_counter() - start
         assert cold['failed_translation_units'] == 0 and warm['noop']
+        progress_measurements = {}
+        if arguments.progress_overhead:
+            from legacygraph.progress import StderrProgress
+            timings = {"disabled": [], "enabled": []}
+            with (root / 'progress.log').open('w') as sink:
+                observer = StderrProgress(sink)
+                for repetition in range(3):
+                    for enabled in ((False, True) if repetition % 2 == 0 else (True, False)):
+                        start = perf_counter()
+                        measured = scan_repository(root, db, manifest, force=True,
+                            preferred_legacy_encoding='cp932', on_event=observer if enabled else None)
+                        elapsed = perf_counter()-start
+                        assert measured['failed_translation_units'] == 0
+                        timings['enabled' if enabled else 'disabled'].append(elapsed)
+            off = sum(timings['disabled'])/3
+            on = sum(timings['enabled'])/3
+            progress_measurements = dict(
+                forced_scan_progress_disabled_mean_s=round(off,6),
+                forced_scan_progress_enabled_mean_s=round(on,6),
+                observed_progress_difference_s=round(on-off,6),
+                progress_log_bytes=(root/'progress.log').stat().st_size,
+                repetitions_per_mode=3,
+            )
         print(json.dumps({
+            **progress_measurements,
             'platform':platform.system(), 'python':platform.python_version(),
             'functions':count, 'files':len(sources),
             'original_bytes':sum(map(len,sources.values())),

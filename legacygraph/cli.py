@@ -16,6 +16,7 @@ from .cli_queries import register_query_commands
 from .discovery import discover_repository_files, resolve_repo_root
 from .index import IndexStore
 from .scanner import scan_repository
+from .progress import Progress, StderrProgress, write_json
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -165,6 +166,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit output in JSON format.",
     )
+    p_scan.add_argument("--progress", action="store_true", help="Emit privacy-safe progress and wall timings to stderr; JSON stdout is unchanged.")
     p_scan.add_argument('--legacy-encoding', default='cp1252', help='Strict parser fallback encoding, e.g. cp932; UTF-8/BOM take precedence.')
     for command in (p_scan, p_stat, p_man):
         command.add_argument('--parser-input', choices=('utf8-overlay', 'native'), default='utf8-overlay',
@@ -350,6 +352,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
+    observer = StderrProgress(sys.stderr) if args.progress else None
+    output_progress = Progress(observer, scope="cli")
     try:
         summary = scan_repository(
             repo_root=args.repo,
@@ -358,6 +362,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             force=args.force,
             preferred_legacy_encoding=args.legacy_encoding,
             parser_input_policy=args.parser_input,
+            on_event=observer,
         )
     except LibclangUnavailableError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -367,7 +372,10 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         return 1
 
     if args.json:
-        print(json.dumps(summary, indent=2))
+        if args.progress:
+            write_json(summary, sys.stdout, output_progress)
+        else:
+            print(json.dumps(summary, indent=2))
     else:
         print(f"Database:                   {summary['db_path']}")
         print(f"Repository root:            {summary['repo_root']}")

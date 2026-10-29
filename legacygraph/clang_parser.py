@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 import hashlib
 import re
 from pathlib import Path
@@ -196,6 +197,7 @@ class ClangParser:
         self.last_consumed_files: set[str] = set()
         self.last_file_hashes: dict[str, str] = {}
         self._index: Any | None = None
+        self._progress = None
 
     def _ensure_index(self) -> Any:
         if self._index is not None:
@@ -415,6 +417,10 @@ class ClangParser:
 
         return args, forced_deps, diagnostics, fatal_config
 
+    def _phase(self, name, **fields):
+        return (self._progress.phase(name, **fields) if self._progress is not None
+                else nullcontext())
+
     def _original_offset(self, relative: str, offset: int) -> int:
         buffer = self._source_buffers.get(relative)
         if buffer is None or self.parser_input_policy == "native":
@@ -436,47 +442,52 @@ class ClangParser:
         """
         mismatches = set()
         overlays = {}
-        for relative, raw in originals.items():
-            buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
-            self._source_buffers[relative] = buffer
-            if self.parser_input_policy == "utf8-overlay":
-                overlays[str(self.repo_root / relative)] = buffer.parser
-        for _ in range(64):
-            tu = idx.parse(str(main_abs), args=args, options=options,
-                           unsaved_files=list(overlays.items()))
-            consumed_paths = {str(main_abs)}
-            consumed_paths.update(inc.include.name for inc in tu.get_includes()
-                                  if inc.include is not None)
-            changed = False
-            for path in sorted(consumed_paths):
-                relative = self._try_repo_relative(path)
-                if relative is None:
-                    continue  # Never transcode SDK/external headers.
-                consumed = _compiled_file_bytes(tu, Path(path))
-                if consumed is None and relative in originals:
-                    mismatches.add(relative)
-                    continue
-                if relative in originals:
-                    buffer = self._source_buffers[relative]
-                    expected = (buffer.parser if self.parser_input_policy == "utf8-overlay"
-                                else buffer.original)
-                    if consumed != expected:
+        with self._phase("parser_input_preparation"):
+            for relative, raw in originals.items():
+                buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
+                self._source_buffers[relative] = buffer
+                if self.parser_input_policy == "utf8-overlay":
+                    overlays[str(self.repo_root / relative)] = buffer.parser
+        for round_number in range(1, 65):
+            with self._phase('native_parse', round=round_number, overlays=len(overlays)):
+                if self._progress is not None:
+                    self._progress.native_calls += 1
+                tu = idx.parse(str(main_abs), args=args, options=options,
+                               unsaved_files=list(overlays.items()))
+            with self._phase("overlay_discovery"):
+                consumed_paths = {str(main_abs)}
+                consumed_paths.update(inc.include.name for inc in tu.get_includes()
+                                      if inc.include is not None)
+                changed = False
+                for path in sorted(consumed_paths):
+                    relative = self._try_repo_relative(path)
+                    if relative is None:
+                        continue  # Never transcode SDK/external headers.
+                    consumed = _compiled_file_bytes(tu, Path(path))
+                    if consumed is None and relative in originals:
                         mismatches.add(relative)
-                else:
-                    # Clang rejects UTF-16/32 BOMs before exposing a buffer. This
-                    # round is discovery only: freeze disk bytes for the next
-                    # overlay round, which must expose the exact UTF-8 view.
-                    unavailable = consumed is None
-                    raw = (self.repo_root / relative).read_bytes() if unavailable else consumed
-                    originals[relative] = raw
-                    hashes[relative] = hashlib.sha256(raw).hexdigest()
-                    buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
-                    self._source_buffers[relative] = buffer
-                    if self.parser_input_policy == "utf8-overlay" and (unavailable or buffer.parser != raw):
-                        overlays[str(self.repo_root / relative)] = buffer.parser
-                        changed = True
-                    elif unavailable:
-                        mismatches.add(relative)
+                        continue
+                    if relative in originals:
+                        buffer = self._source_buffers[relative]
+                        expected = (buffer.parser if self.parser_input_policy == "utf8-overlay"
+                                    else buffer.original)
+                        if consumed != expected:
+                            mismatches.add(relative)
+                    else:
+                        # Clang rejects UTF-16/32 BOMs before exposing a buffer. This
+                        # round is discovery only: freeze disk bytes for the next
+                        # overlay round, which must expose the exact UTF-8 view.
+                        unavailable = consumed is None
+                        raw = (self.repo_root / relative).read_bytes() if unavailable else consumed
+                        originals[relative] = raw
+                        hashes[relative] = hashlib.sha256(raw).hexdigest()
+                        buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
+                        self._source_buffers[relative] = buffer
+                        if self.parser_input_policy == "utf8-overlay" and (unavailable or buffer.parser != raw):
+                            overlays[str(self.repo_root / relative)] = buffer.parser
+                            changed = True
+                        elif unavailable:
+                            mismatches.add(relative)
             if not changed:
                 return tu, mismatches
         raise ValueError("Parser input include discovery exceeded 64 overlay rounds")
@@ -573,263 +584,266 @@ class ClangParser:
                 has_incomplete_dependencies=True,
             )
 
-        # Collect dependencies, diagnostics, and active macro offsets
-        dep_map: dict[tuple[str, str, str | None, int | None, bool, str], TUDependencyRecord] = {}
-        for fdep in forced_deps:
-            key = (
-                fdep.repo_path,
-                fdep.dependency_kind.value,
-                fdep.included_from_path,
-                fdep.include_line,
-                fdep.is_missing,
-                fdep.missing_include_text,
-            )
-            dep_map[key] = fdep
-
-        forced_repo_paths = {d.repo_path for d in forced_deps if not d.is_missing and d.repo_path}
-        for inc in tu.get_includes():
-            inc_file = inc.include
-            if inc_file is None:
-                continue
-            rel_inc = self._try_repo_relative(inc_file.name)
-            if rel_inc is None or rel_inc == main_rel:
-                continue
-            if rel_inc not in pre_hash_by_rel:
-                try:
-                    inc_abs, _ = ensure_contained_path(self.repo_root, rel_inc)
-                    raw_b = _compiled_file_bytes(tu, inc_abs)
-                    if raw_b is None:
-                        consumed_buffer_mismatches.add(rel_inc)
-                        raw_b = inc_abs.read_bytes()
-                    pre_bytes_by_rel[rel_inc] = raw_b
-                    pre_hash_by_rel[rel_inc] = hashlib.sha256(raw_b).hexdigest()
-                except OSError:
-                    pass
-            src_rel = self._try_repo_relative(inc.source.name) if inc.source is not None else None
-            if src_rel is None:
-                kind = (
-                    DependencyKind.PCH_HEADER
-                    if (spec.build_context.pch_header and rel_inc.endswith(spec.build_context.pch_header))
-                    else DependencyKind.FORCED_INCLUDE
+        with self._phase("dependencies_diagnostics"):
+            # Collect dependencies, diagnostics, and active macro offsets
+            dep_map: dict[tuple[str, str, str | None, int | None, bool, str], TUDependencyRecord] = {}
+            for fdep in forced_deps:
+                key = (
+                    fdep.repo_path,
+                    fdep.dependency_kind.value,
+                    fdep.included_from_path,
+                    fdep.include_line,
+                    fdep.is_missing,
+                    fdep.missing_include_text,
                 )
-                src_rel = main_rel
-                inc_line = None
-            elif inc.depth == 1 and src_rel == main_rel and rel_inc not in forced_repo_paths:
-                kind = DependencyKind.DIRECT_INCLUDE
-                inc_line = int(inc.location.line) if inc.location.line else None
-            elif rel_inc in forced_repo_paths:
-                continue
-            else:
-                kind = DependencyKind.TRANSITIVE_INCLUDE
-                inc_line = int(inc.location.line) if inc.location.line else None
+                dep_map[key] = fdep
 
-            rec = TUDependencyRecord(
-                repo_path=rel_inc,
-                dependency_kind=kind,
-                included_from_path=src_rel,
-                include_line=inc_line,
-                is_missing=False,
-            )
-            dep_map[
-                (
-                    rec.repo_path,
-                    rec.dependency_kind.value,
-                    rec.included_from_path,
-                    rec.include_line,
-                    rec.is_missing,
-                    rec.missing_include_text,
-                )
-            ] = rec
+            forced_repo_paths = {d.repo_path for d in forced_deps if not d.is_missing and d.repo_path}
+            for inc in tu.get_includes():
+                inc_file = inc.include
+                if inc_file is None:
+                    continue
+                rel_inc = self._try_repo_relative(inc_file.name)
+                if rel_inc is None or rel_inc == main_rel:
+                    continue
+                if rel_inc not in pre_hash_by_rel:
+                    try:
+                        inc_abs, _ = ensure_contained_path(self.repo_root, rel_inc)
+                        raw_b = _compiled_file_bytes(tu, inc_abs)
+                        if raw_b is None:
+                            consumed_buffer_mismatches.add(rel_inc)
+                            raw_b = inc_abs.read_bytes()
+                        pre_bytes_by_rel[rel_inc] = raw_b
+                        pre_hash_by_rel[rel_inc] = hashlib.sha256(raw_b).hexdigest()
+                    except OSError:
+                        pass
+                src_rel = self._try_repo_relative(inc.source.name) if inc.source is not None else None
+                if src_rel is None:
+                    kind = (
+                        DependencyKind.PCH_HEADER
+                        if (spec.build_context.pch_header and rel_inc.endswith(spec.build_context.pch_header))
+                        else DependencyKind.FORCED_INCLUDE
+                    )
+                    src_rel = main_rel
+                    inc_line = None
+                elif inc.depth == 1 and src_rel == main_rel and rel_inc not in forced_repo_paths:
+                    kind = DependencyKind.DIRECT_INCLUDE
+                    inc_line = int(inc.location.line) if inc.location.line else None
+                elif rel_inc in forced_repo_paths:
+                    continue
+                else:
+                    kind = DependencyKind.TRANSITIVE_INCLUDE
+                    inc_line = int(inc.location.line) if inc.location.line else None
 
-        diagnostics: list[DiagnosticRecord] = list(config_diags)
-        has_error_or_fatal = False
-        has_incomplete_deps = any(d.is_missing for d in forced_deps)
-
-        for d in tu.diagnostics:
-            sev_num = int(d.severity)
-            if sev_num <= int(cindex.Diagnostic.Note):
-                sev = DiagnosticSeverity.INFO
-            elif sev_num == int(cindex.Diagnostic.Warning):
-                sev = DiagnosticSeverity.WARNING
-            elif sev_num == int(cindex.Diagnostic.Error):
-                sev = DiagnosticSeverity.ERROR
-                has_error_or_fatal = True
-            else:
-                sev = DiagnosticSeverity.FATAL
-                has_error_or_fatal = True
-
-            msg = str(d.spelling)
-            missing_dep = ""
-            m_inc = _MISSING_HEADER_RE.search(msg)
-            if m_inc:
-                missing_dep = m_inc.group(1)
-                has_incomplete_deps = True
-
-            d_span = self._diagnostic_span(d, pre_bytes_by_rel, main_rel, main_default_span)
-            if missing_dep:
-                inc_from = d_span.repo_path if d_span else main_rel
-                inc_line = d_span.start_line if d_span else None
-                mrec = TUDependencyRecord(
-                    repo_path="",
-                    dependency_kind=DependencyKind.DIRECT_INCLUDE,
-                    included_from_path=inc_from,
+                rec = TUDependencyRecord(
+                    repo_path=rel_inc,
+                    dependency_kind=kind,
+                    included_from_path=src_rel,
                     include_line=inc_line,
-                    is_missing=True,
-                    missing_include_text=missing_dep,
+                    is_missing=False,
                 )
                 dep_map[
                     (
-                        mrec.repo_path,
-                        mrec.dependency_kind.value,
-                        mrec.included_from_path,
-                        mrec.include_line,
-                        mrec.is_missing,
-                        mrec.missing_include_text,
+                        rec.repo_path,
+                        rec.dependency_kind.value,
+                        rec.included_from_path,
+                        rec.include_line,
+                        rec.is_missing,
+                        rec.missing_include_text,
                     )
-                ] = mrec
+                ] = rec
 
-            diagnostics.append(
-                DiagnosticRecord(
-                    severity=sev,
-                    code=str(d.category_name or "clang.diagnostic"),
-                    message=msg,
-                    span=d_span,
-                    parse_scope="tu",
-                    missing_dependency=missing_dep,
+            diagnostics: list[DiagnosticRecord] = list(config_diags)
+            has_error_or_fatal = False
+            has_incomplete_deps = any(d.is_missing for d in forced_deps)
+
+            for d in tu.diagnostics:
+                sev_num = int(d.severity)
+                if sev_num <= int(cindex.Diagnostic.Note):
+                    sev = DiagnosticSeverity.INFO
+                elif sev_num == int(cindex.Diagnostic.Warning):
+                    sev = DiagnosticSeverity.WARNING
+                elif sev_num == int(cindex.Diagnostic.Error):
+                    sev = DiagnosticSeverity.ERROR
+                    has_error_or_fatal = True
+                else:
+                    sev = DiagnosticSeverity.FATAL
+                    has_error_or_fatal = True
+
+                msg = str(d.spelling)
+                missing_dep = ""
+                m_inc = _MISSING_HEADER_RE.search(msg)
+                if m_inc:
+                    missing_dep = m_inc.group(1)
+                    has_incomplete_deps = True
+
+                d_span = self._diagnostic_span(d, pre_bytes_by_rel, main_rel, main_default_span)
+                if missing_dep:
+                    inc_from = d_span.repo_path if d_span else main_rel
+                    inc_line = d_span.start_line if d_span else None
+                    mrec = TUDependencyRecord(
+                        repo_path="",
+                        dependency_kind=DependencyKind.DIRECT_INCLUDE,
+                        included_from_path=inc_from,
+                        include_line=inc_line,
+                        is_missing=True,
+                        missing_include_text=missing_dep,
+                    )
+                    dep_map[
+                        (
+                            mrec.repo_path,
+                            mrec.dependency_kind.value,
+                            mrec.included_from_path,
+                            mrec.include_line,
+                            mrec.is_missing,
+                            mrec.missing_include_text,
+                        )
+                    ] = mrec
+
+                diagnostics.append(
+                    DiagnosticRecord(
+                        severity=sev,
+                        code=str(d.category_name or "clang.diagnostic"),
+                        message=msg,
+                        span=d_span,
+                        parse_scope="tu",
+                        missing_dependency=missing_dep,
+                    )
                 )
-            )
 
-        # Extract active macro offsets andAST facts
-        macro_offsets: dict[str, set[int]] = {rel: set() for rel in pre_bytes_by_rel}
-        entities_by_key: dict[str, EntityRecord] = {}
-        occurrences: list[SymbolOccurrenceRecord] = []
-        observations: dict[str, ObservationRecord] = {}
-        relations: list[RelationRecord] = []
-        seen_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
-        seen_relation_keys: set[tuple[str, str | None, str, str, str, str, str, int, int]] = set()
-        file_entity_keys: dict[str, str] = {}
+        with self._phase("ast_evidence"):
+            # Extract active macro offsets andAST facts
+            macro_offsets: dict[str, set[int]] = {rel: set() for rel in pre_bytes_by_rel}
+            entities_by_key: dict[str, EntityRecord] = {}
+            occurrences: list[SymbolOccurrenceRecord] = []
+            observations: dict[str, ObservationRecord] = {}
+            relations: list[RelationRecord] = []
+            seen_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
+            seen_relation_keys: set[tuple[str, str | None, str, str, str, str, str, int, int]] = set()
+            file_entity_keys: dict[str, str] = {}
 
-        def ensure_file_entity(repo_path: str) -> str:
-            if repo_path in file_entity_keys:
-                return file_entity_keys[repo_path]
-            fkey = f"file:{repo_path}"
-            entities_by_key[fkey] = EntityRecord(
-                semantic_key=fkey,
-                kind=EntityKind.FILE,
-                name=Path(repo_path).name,
-                qualified_name=repo_path,
-                linkage_scope=LinkageScope.PROJECT,
-                scope_qualifier=repo_path,
-                is_external=False,
-            )
-            file_entity_keys[repo_path] = fkey
-            return fkey
-
-        ensure_file_entity(main_rel)
-
-        # Include relations from preprocessing records
-        for dep in dep_map.values():
-            if not dep.is_missing and dep.repo_path and dep.included_from_path:
-                src_f = ensure_file_entity(dep.included_from_path)
-                tgt_f = ensure_file_entity(dep.repo_path)
-                inc_span = self._make_line_span(
-                    dep.included_from_path,
-                    pre_bytes_by_rel.get(dep.included_from_path, b""),
-                    dep.include_line or 1,
+            def ensure_file_entity(repo_path: str) -> str:
+                if repo_path in file_entity_keys:
+                    return file_entity_keys[repo_path]
+                fkey = f"file:{repo_path}"
+                entities_by_key[fkey] = EntityRecord(
+                    semantic_key=fkey,
+                    kind=EntityKind.FILE,
+                    name=Path(repo_path).name,
+                    qualified_name=repo_path,
+                    linkage_scope=LinkageScope.PROJECT,
+                    scope_qualifier=repo_path,
+                    is_external=False,
                 )
-                obs_key = f"obs:include:{dep.included_from_path}:{dep.include_line or 0}:{dep.repo_path}"
-                observations[obs_key] = ObservationRecord(
-                    observation_key=obs_key,
-                    observation_type="include_directive",
-                    span=inc_span,
-                    subject_semantic_key=src_f,
-                    rule_id="clang.include",
-                    parser_name=self.parser_name,
-                    parser_version=self.parser_version,
-                    details={"target_path": dep.repo_path, "kind": dep.dependency_kind.value},
-                )
-                relations.append(
-                    RelationRecord(
-                        source_semantic_key=src_f,
-                        target_semantic_key=tgt_f,
-                        kind=RelationKind.INCLUDES,
-                        resolution_status=ResolutionStatus.RESOLVED,
-                        dispatch_kind=DispatchKind.STATIC_INCLUDE,
-                        extraction_quality=ExtractionQuality.SEMANTIC,
-                        reason=ResolutionReason.EXACT_SEMANTIC,
-                        evidence=(
-                            RelationEvidenceRecord(
-                                observation_key=obs_key,
-                                span=inc_span,
-                                evidence_snippet_hash=hashlib.sha256(
-                                    dep.repo_path.encode("utf-8")
-                                ).hexdigest()[:16],
-                                rule_id="clang.include",
-                                parser_name=self.parser_name,
-                                parser_version=self.parser_version,
+                file_entity_keys[repo_path] = fkey
+                return fkey
+
+            ensure_file_entity(main_rel)
+
+            # Include relations from preprocessing records
+            for dep in dep_map.values():
+                if not dep.is_missing and dep.repo_path and dep.included_from_path:
+                    src_f = ensure_file_entity(dep.included_from_path)
+                    tgt_f = ensure_file_entity(dep.repo_path)
+                    inc_span = self._make_line_span(
+                        dep.included_from_path,
+                        pre_bytes_by_rel.get(dep.included_from_path, b""),
+                        dep.include_line or 1,
+                    )
+                    obs_key = f"obs:include:{dep.included_from_path}:{dep.include_line or 0}:{dep.repo_path}"
+                    observations[obs_key] = ObservationRecord(
+                        observation_key=obs_key,
+                        observation_type="include_directive",
+                        span=inc_span,
+                        subject_semantic_key=src_f,
+                        rule_id="clang.include",
+                        parser_name=self.parser_name,
+                        parser_version=self.parser_version,
+                        details={"target_path": dep.repo_path, "kind": dep.dependency_kind.value},
+                    )
+                    relations.append(
+                        RelationRecord(
+                            source_semantic_key=src_f,
+                            target_semantic_key=tgt_f,
+                            kind=RelationKind.INCLUDES,
+                            resolution_status=ResolutionStatus.RESOLVED,
+                            dispatch_kind=DispatchKind.STATIC_INCLUDE,
+                            extraction_quality=ExtractionQuality.SEMANTIC,
+                            reason=ResolutionReason.EXACT_SEMANTIC,
+                            evidence=(
+                                RelationEvidenceRecord(
+                                    observation_key=obs_key,
+                                    span=inc_span,
+                                    evidence_snippet_hash=hashlib.sha256(
+                                        dep.repo_path.encode("utf-8")
+                                    ).hexdigest()[:16],
+                                    rule_id="clang.include",
+                                    parser_name=self.parser_name,
+                                    parser_version=self.parser_version,
+                                ),
                             ),
-                        ),
+                        )
                     )
-                )
 
-        # Walk top-level and first-party cursors
-        for top_cursor in tu.cursor.get_children():
-            ckind = top_cursor.kind
-            loc_file = top_cursor.location.file
-            if loc_file is None:
-                continue
-            rel_path = self._try_repo_relative(loc_file.name)
-            if rel_path is None:
-                # Skip deep traversal of SDK/external system headers outside repo_root
-                continue
-            if rel_path not in pre_bytes_by_rel:
-                try:
-                    p_abs, _ = ensure_contained_path(self.repo_root, rel_path)
-                    b = p_abs.read_bytes()
-                    pre_bytes_by_rel[rel_path] = b
-                    pre_hash_by_rel[rel_path] = hashlib.sha256(b).hexdigest()
-                    macro_offsets.setdefault(rel_path, set())
-                except OSError:
+            # Walk top-level and first-party cursors
+            for top_cursor in tu.cursor.get_children():
+                ckind = top_cursor.kind
+                loc_file = top_cursor.location.file
+                if loc_file is None:
+                    continue
+                rel_path = self._try_repo_relative(loc_file.name)
+                if rel_path is None:
+                    # Skip deep traversal of SDK/external system headers outside repo_root
+                    continue
+                if rel_path not in pre_bytes_by_rel:
+                    try:
+                        p_abs, _ = ensure_contained_path(self.repo_root, rel_path)
+                        b = p_abs.read_bytes()
+                        pre_bytes_by_rel[rel_path] = b
+                        pre_hash_by_rel[rel_path] = hashlib.sha256(b).hexdigest()
+                        macro_offsets.setdefault(rel_path, set())
+                    except OSError:
+                        continue
+
+                if ckind in (
+                    cindex.CursorKind.MACRO_INSTANTIATION,
+                    cindex.CursorKind.MACRO_DEFINITION,
+                ):
+                    macro_offsets.setdefault(rel_path, set()).add(
+                        self._original_offset(rel_path, int(top_cursor.extent.start.offset)))
+                    continue
+                if ckind == cindex.CursorKind.INCLUSION_DIRECTIVE:
                     continue
 
-            if ckind in (
-                cindex.CursorKind.MACRO_INSTANTIATION,
-                cindex.CursorKind.MACRO_DEFINITION,
-            ):
-                macro_offsets.setdefault(rel_path, set()).add(
-                    self._original_offset(rel_path, int(top_cursor.extent.start.offset)))
-                continue
-            if ckind == cindex.CursorKind.INCLUSION_DIRECTIVE:
-                continue
+                if not has_error_or_fatal:
+                    self._visit_cursor(
+                        top_cursor,
+                        spec=spec,
+                        main_rel=main_rel,
+                        enclosing_callable_key=None,
+                        enclosing_entity_key=None,
+                        pre_bytes_by_rel=pre_bytes_by_rel,
+                        entities_by_key=entities_by_key,
+                        occurrences=occurrences,
+                        observations=observations,
+                        relations=relations,
+                        seen_occurrence_keys=seen_occurrence_keys,
+                        seen_relation_keys=seen_relation_keys,
+                        ensure_file_entity=ensure_file_entity,
+                    )
 
-            if not has_error_or_fatal:
-                self._visit_cursor(
-                    top_cursor,
-                    spec=spec,
-                    main_rel=main_rel,
-                    enclosing_callable_key=None,
-                    enclosing_entity_key=None,
-                    pre_bytes_by_rel=pre_bytes_by_rel,
-                    entities_by_key=entities_by_key,
-                    occurrences=occurrences,
-                    observations=observations,
-                    relations=relations,
-                    seen_occurrence_keys=seen_occurrence_keys,
-                    seen_relation_keys=seen_relation_keys,
-                    ensure_file_entity=ensure_file_entity,
-                )
-
-        # Verify source files did not mutate during parsing
-        mutated_files: list[str] = list(consumed_buffer_mismatches)
-        for rel_p, before_sha in list(pre_hash_by_rel.items()):
-            try:
-                p_abs, _ = ensure_contained_path(self.repo_root, rel_p, allow_nonexistent=False)
-                after_bytes = p_abs.read_bytes()
-                after_sha = hashlib.sha256(after_bytes).hexdigest()
-                if after_sha != before_sha:
+        with self._phase("parser_source_validation"):
+            # Verify source files did not mutate during parsing
+            mutated_files: list[str] = list(consumed_buffer_mismatches)
+            for rel_p, before_sha in list(pre_hash_by_rel.items()):
+                try:
+                    p_abs, _ = ensure_contained_path(self.repo_root, rel_p, allow_nonexistent=False)
+                    after_bytes = p_abs.read_bytes()
+                    after_sha = hashlib.sha256(after_bytes).hexdigest()
+                    if after_sha != before_sha:
+                        mutated_files.append(rel_p)
+                except Exception:
                     mutated_files.append(rel_p)
-            except Exception:
-                mutated_files.append(rel_p)
 
         self.last_macro_offsets = macro_offsets
         self.active_macro_offsets = macro_offsets
