@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import re
 from pathlib import Path
@@ -38,7 +38,7 @@ from .models import (
 )
 
 CLANG_PARSER_NAME = "clang"
-CLANG_PARSER_VERSION = "0.3.0"
+CLANG_PARSER_VERSION = "0.3.1"
 DEFAULT_MFC_RULE_VERSION = MFC_RULE_VERSION
 
 try:
@@ -149,7 +149,6 @@ _IGNORED_HARMLESS_FLAGS: frozenset[str] = frozenset(
         "/MP",
         "/permissive-",
         "/permissive",
-        "/Zc:wchar_t",
         "/Zc:inline",
         "/Zc:forScope",
         "/Zc:__cplusplus",
@@ -198,6 +197,7 @@ class ClangParser:
         self.last_file_hashes: dict[str, str] = {}
         self._index: Any | None = None
         self._progress = None
+        self._ast_paths: dict[str, str | None] | None = None
 
     def _ensure_index(self) -> Any:
         if self._index is not None:
@@ -251,12 +251,34 @@ class ClangParser:
             return (self.repo_root / cand).resolve(strict=False)
         return (working_dir / cand).resolve(strict=False)
 
+    @contextmanager
+    def _ast_path_scope(self):
+        """Cache exact path spellings only during this AST walk, never across TUs.
+
+        Every cached result is checked again during source validation. Repointed
+        symlinks, newly present paths and changed containment invalidate the TU.
+        The cap bounds retention for unusually broad include graphs.
+        """
+        paths: dict[str, str | None] = {}
+        self._ast_paths = paths
+        try:
+            yield paths
+        finally:
+            self._ast_paths = None
+
     def _try_repo_relative(self, path: str | Path) -> str | None:
+        spelling = str(path)
+        cache = self._ast_paths
+        if cache is not None and spelling in cache:
+            return cache[spelling]
         try:
             _, rel = ensure_contained_path(self.repo_root, path, allow_nonexistent=False)
-            return rel if rel != "." else None
+            result = rel if rel != "." else None
         except Exception:
-            return None
+            result = None
+        if cache is not None and len(cache) < 4096:
+            cache[spelling] = result
+        return result
 
     def _build_clang_args(
         self, spec: TranslationUnitSpec, main_span: SourceSpan
@@ -366,6 +388,7 @@ class ClangParser:
                     )
                 )
 
+        native_wchar = True
         all_extra_flags = (*ctx.extra_flags, *spec.per_file_flags)
         for flag in all_extra_flags:
             if not flag:
@@ -396,6 +419,20 @@ class ClangParser:
                 )
                 fatal_config = True
                 continue
+            if flag in ("/Zc:wchar_t", "/Zc:wchar_t-"):
+                if ctx.compiler_family.lower() not in ("msvc", "clang-cl"):
+                    diagnostics.append(DiagnosticRecord(
+                        severity=DiagnosticSeverity.UNSUPPORTED,
+                        code="clang.unsupported_wchar_context",
+                        message="/Zc:wchar_t requires an explicit msvc or clang-cl Windows context.",
+                        span=main_span, parse_scope="tu", unsupported_feature=flag,
+                    ))
+                    fatal_config = True
+                else:
+                    # Last context/per-file setting wins. Built-in wchar_t is
+                    # Clang's default; there is no supported -fwchar inverse.
+                    native_wchar = not flag.endswith("-")
+                continue
             if flag.startswith("/Fp"):
                 continue
             if flag in _IGNORED_HARMLESS_FLAGS or flag.startswith(("/Fo", "/Fd", "/Fe", "/Fa", "/FR")):
@@ -415,6 +452,9 @@ class ClangParser:
             )
             fatal_config = True
 
+        if not native_wchar:
+            # Verified libclang 18.1.1 frontend option; driver -fno-wchar fails.
+            args.extend(["-Xclang", "-fno-wchar"])
         return args, forced_deps, diagnostics, fatal_config
 
     def _phase(self, name, **fields):
@@ -711,7 +751,7 @@ class ClangParser:
                     )
                 )
 
-        with self._phase("ast_evidence"):
+        with self._ast_path_scope() as ast_paths, self._phase("ast_evidence"):
             # Extract active macro offsets andAST facts
             macro_offsets: dict[str, set[int]] = {rel: set() for rel in pre_bytes_by_rel}
             entities_by_key: dict[str, EntityRecord] = {}
@@ -835,6 +875,11 @@ class ClangParser:
         with self._phase("parser_source_validation"):
             # Verify source files did not mutate during parsing
             mutated_files: list[str] = list(consumed_buffer_mismatches)
+            # Re-resolve cached spellings with the same canonical containment
+            # check, including negatives. Never trust a path from an old walk.
+            for spelling, expected in ast_paths.items():
+                if self._try_repo_relative(spelling) != expected:
+                    mutated_files.append(expected or "AST path containment changed")
             for rel_p, before_sha in list(pre_hash_by_rel.items()):
                 try:
                     p_abs, _ = ensure_contained_path(self.repo_root, rel_p, allow_nonexistent=False)

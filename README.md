@@ -45,6 +45,11 @@ The implemented CLI/explorer MVP follows [the technical plan](docs/IMPLEMENTATIO
 
 ## Semantic C++ Parsing & Incremental Indexing (Step 2)
 
+Parser 0.3.1 supports build-context `/Zc:wchar_t` settings and a bounded AST
+path cache with containment revalidation. See [C++ compatibility, configuration
+and synthetic benchmarks](docs/CPP_COMPATIBILITY.md). The first scan after this
+parser upgrade reparses previously indexed TUs.
+
 When the optional `semantic` extra (`libclang==18.1.1`, the tested version) is installed in the local Python environment, LegacyGraph provides `ClangParser` (`legacygraph.clang_parser`) and `scan_repository` (`legacygraph.scanner`):
 
 - **Semantic AST Extraction**: Extracts namespaces, classes, structs, enums, functions, methods, constructors, destructors, fields, typedefs, and file entities with original root-relative byte spans and signatures.

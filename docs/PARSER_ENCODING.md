@@ -86,7 +86,9 @@ This is a Unicode source **analysis model**, not exact legacy-build emulation.
 Transcoding narrow literals can change byte representation, `sizeof`, character
 values, conditional compilation and compile-time behavior. Even a clean AST
 therefore does not establish equivalence to the original compiler. `wchar_t`
-mode and other compiler/ABI settings are separate concerns.
+mode and other compiler/ABI settings are separate concerns. See
+[C++ compatibility](CPP_COMPATIBILITY.md) for parser 0.3.1 wchar settings,
+remaining diagnostics and AST performance measurements.
 
 Non-trivial objects passed through varargs, types defined in result declarations,
 nested block-comment warnings and trailing preprocessor tokens remain independent
