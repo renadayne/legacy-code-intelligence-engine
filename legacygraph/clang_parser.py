@@ -463,8 +463,10 @@ class ClangParser:
         preprocessing and not confirmation of the original build's settings.
         """
         args, _, diagnostics, fatal = self._build_clang_args(spec, None)
-        wchar_flags = [flag for flag in (*spec.build_context.extra_flags, *spec.per_file_flags)
-                       if flag in ("/Zc:wchar_t", "/Zc:wchar_t-")]
+        wchar_settings = [(scope, flag)
+                          for scope, flags in (("context", spec.build_context.extra_flags),
+                                               ("translation_unit", spec.per_file_flags))
+                          for flag in flags if flag in ("/Zc:wchar_t", "/Zc:wchar_t-")]
         macros = {}
         for name in ("UNICODE", "_UNICODE"):
             definitions = [arg[2:] for arg in args if arg.startswith("-D")
@@ -476,7 +478,9 @@ class ClangParser:
             "language_standard": next(arg[5:] for arg in args if arg.startswith("-std=")),
             "target": next((arg[9:] for arg in args if arg.startswith("--target=")), "host-default"),
             "wchar_mode": ("unknown" if fatal else "typedef" if "-fno-wchar" in args else "native"),
-            "wchar_selection": "explicit" if wchar_flags else "default",
+            "wchar_selection": "explicit" if wchar_settings else "default",
+            "wchar_selection_scope": wchar_settings[-1][0] if wchar_settings else "default",
+            "wchar_selected_flag": wchar_settings[-1][1] if wchar_settings else None,
             "command_line_macros": macros,
             "diagnostic_codes": sorted({d.code for d in diagnostics}),
             "source_preprocessing_verified": False,

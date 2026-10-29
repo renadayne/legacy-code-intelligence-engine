@@ -1,5 +1,11 @@
 # Remaining semantic errors: investigation and parser 0.3.2
 
+The [post-0.3.2 follow-up](POST_032_CONTEXT_HANDOFF.md) records the newer
+operator-confirmed wchar discrepancy, shared-header blocker and enum syntax
+finding, plus `--expect-wchar-mode` validation. The earlier unknown local
+selection discussed below is superseded by that report, not by a private scan
+performed by this agent.
+
 This investigation uses the tool and invented C++ fixtures only. It does not
 establish the effective settings, source causes or acceptance of a private
 application. A committed partial generation still excludes errored TUs;

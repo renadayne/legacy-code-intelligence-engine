@@ -30,6 +30,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "explain-context", help="Report selected analysis settings without parsing source or opening an index.")
     p_explain.add_argument("--repo", default=".")
     p_explain.add_argument("--manifest", required=True)
+    p_explain.add_argument("--expect-wchar-mode", choices=("native", "typedef"),
+                           help="Check every imported TU against an operator-supplied expectation; does not change flags.")
 
     # init
     p_init = subparsers.add_parser(
@@ -407,11 +409,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine = ClangParser(args.repo)
         rows = [{"imported_tu_ordinal": ordinal, **engine.explain_context(spec)}
                 for ordinal, spec in enumerate(imported.translation_units, 1)]
+        if args.expect_wchar_mode:
+            for row in rows:
+                row["expected_wchar_mode"] = args.expect_wchar_mode
+                row["wchar_expectation_matches"] = (
+                    row["configuration_supported"] and row["wchar_mode"] == args.expect_wchar_mode)
         print(json.dumps({"parser_version": CLANG_PARSER_VERSION,
                           "import_warning_count": len(imported.warnings),
                           "translation_units": rows}, indent=2))
         return 3 if (not rows or imported.warnings or
-                     any(not row["configuration_supported"] for row in rows)) else 0
+                     any(not row["configuration_supported"] or
+                         row.get("wchar_expectation_matches") is False for row in rows)) else 0
 
     if args.command == "init":
         return _cmd_init(args)

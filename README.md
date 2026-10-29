@@ -49,6 +49,9 @@ Parser 0.3.2 rejects diagnostic flags that could hide semantic errors. Use
 `python -m legacygraph explain-context --repo <root> --manifest <manifest>`
 to inspect selected wchar, target and Unicode settings without parsing source.
 See [remaining semantic errors and operator validation](docs/SEMANTIC_REPORT_032.md).
+For a known expected mode, append `--expect-wchar-mode typedef` (or `native`)
+to make mismatches fail the check without changing the manifest. See the
+[post-0.3.2 context correction checklist](docs/POST_032_CONTEXT_HANDOFF.md).
 
 Parser 0.3.1 supports build-context `/Zc:wchar_t` settings and a bounded AST
 path cache with containment revalidation. See [C++ compatibility, configuration
