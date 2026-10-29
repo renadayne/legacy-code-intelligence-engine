@@ -59,6 +59,11 @@ When the optional `semantic` extra (`libclang==18.1.1`, the tested version) is i
 
 ## Honest Limitations (What Is Not Implemented Yet)
 
+For legacy source parsing, see [parser encoding policy and original-byte evidence](docs/PARSER_ENCODING.md).
+`scan --legacy-encoding cp932` now supplies strict UTF-8 parser overlays for contained
+main files and consumed headers; original bytes remain unchanged. This analysis
+model can change narrow-literal semantics and is not exact build emulation.
+
 Use a stable source snapshot while indexing. Incremental hashing covers consumed
 files inside the source root. SDK/external headers and environment changes are
 not automatically tracked: pin the toolchain in the manifest and use `scan
@@ -151,7 +156,7 @@ or prepare an explicit manifest. Generated headers must already exist.
 Re-run `scan` after changes for incremental updates. New headers conservatively
 invalidate contexts because they may shadow prior include targets. Use
 `--legacy-encoding cp932` (or another approved encoding) for non-UTF8 source;
-source decoding support does not guarantee Clang accepts that project's dialect.
+the encoding overlay does not guarantee Clang accepts that project's dialect or ABI.
 
 ## Offline installation and deployment
 

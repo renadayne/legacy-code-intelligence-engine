@@ -138,6 +138,7 @@ def scan_repository(
     exclude_dirs: Iterable[str] = (),
     preferred_legacy_encoding: str = "cp1252",
     parser: ClangParser | None = None,
+    parser_input_policy: str = "utf8-overlay",
     parser_version: str = CLANG_PARSER_VERSION,
     mfc_rule_version: str = DEFAULT_MFC_RULE_VERSION,
     on_before_publish: Callable[[IndexStore, int], None] | None = None,
@@ -152,6 +153,11 @@ def scan_repository(
     5. Atomically publish the staging generation; roll back on any unexpected exception so the previous published snapshot remains intact.
     """
     canonical_root = resolve_repo_root(repo_root)
+    active_parser = parser if parser is not None else ClangParser(
+        canonical_root, parser_version=parser_version, mfc_rule_version=mfc_rule_version,
+        preferred_legacy_encoding=preferred_legacy_encoding,
+        parser_input_policy=parser_input_policy,
+    )
     resolved_db = Path(db_path)
     if not resolved_db.is_absolute():
         resolved_db = (Path.cwd() / resolved_db).resolve(strict=False)
@@ -219,7 +225,7 @@ def scan_repository(
                 store, set(active_specs_by_key.keys())
             )
 
-            eff_parser_version = parser.parser_version if parser is not None else parser_version
+            eff_parser_version = active_parser.parser_version
             eff_mfc_version = parser.mfc_rule_version if parser is not None else mfc_rule_version
 
             invalidated_items = store.compute_invalidated_translation_units(
@@ -268,7 +274,7 @@ def scan_repository(
                     "db_path": str(resolved_db),
                     "repo_root": str(canonical_root),
                     "manifest_path": str(resolved_manifest),
-                    "parser_name": parser.parser_name if parser is not None else CLANG_PARSER_NAME,
+                    "parser_name": active_parser.parser_name,
                     "parser_version": eff_parser_version,
                     "mfc_rule_version": eff_mfc_version,
                     "generation_id": prev_published_id,
@@ -297,15 +303,6 @@ def scan_repository(
                 inherit_from_published=True,
             )
             try:
-                active_parser = (
-                    parser
-                    if parser is not None
-                    else ClangParser(
-                        canonical_root,
-                        parser_version=eff_parser_version,
-                        mfc_rule_version=eff_mfc_version,
-                    )
-                )
                 tu_results: list[dict[str, Any]] = []
                 surfaced_diagnostics: list[dict[str, Any]] = []
                 clean_count = 0

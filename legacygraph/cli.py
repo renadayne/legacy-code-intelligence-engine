@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .parser_input import policy_version
+
 import argparse
 import json
 import sys
@@ -163,7 +165,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit output in JSON format.",
     )
-    p_scan.add_argument('--legacy-encoding', default='cp1252', help='Fallback source encoding, e.g. cp932.')
+    p_scan.add_argument('--legacy-encoding', default='cp1252', help='Strict parser fallback encoding, e.g. cp932; UTF-8/BOM take precedence.')
+    for command in (p_scan, p_stat, p_man):
+        command.add_argument('--parser-input', choices=('utf8-overlay', 'native'), default='utf8-overlay',
+                             help='Parser input model (default: contained source UTF-8 overlays).')
+    for command in (p_stat, p_man):
+        command.add_argument('--legacy-encoding', default='cp1252')
 
     register_query_commands(subparsers)
     return parser
@@ -267,7 +274,7 @@ def _cmd_scan_manifest(args: argparse.Namespace) -> int:
             deactivate_unlisted_for_contexts=args.deactivate_unlisted,
         )
         invalidated = store.compute_invalidated_translation_units(
-            parser_version=CLANG_PARSER_VERSION, mfc_rule_version=DEFAULT_MFC_RULE_VERSION,
+            parser_version=policy_version(CLANG_PARSER_VERSION, args.legacy_encoding, args.parser_input), mfc_rule_version=DEFAULT_MFC_RULE_VERSION,
         )
 
     payload = {
@@ -313,7 +320,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if args.check_invalidated:
             summary["invalidated_translation_units"] = (
                 store.compute_invalidated_translation_units(
-                    parser_version=CLANG_PARSER_VERSION,
+                    parser_version=policy_version(CLANG_PARSER_VERSION, args.legacy_encoding, args.parser_input),
                     mfc_rule_version=DEFAULT_MFC_RULE_VERSION,
                 )
             )
@@ -350,6 +357,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             manifest_path=args.manifest,
             force=args.force,
             preferred_legacy_encoding=args.legacy_encoding,
+            parser_input_policy=args.parser_input,
         )
     except LibclangUnavailableError as exc:
         print(f"Error: {exc}", file=sys.stderr)

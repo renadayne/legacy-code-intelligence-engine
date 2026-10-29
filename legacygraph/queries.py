@@ -1099,8 +1099,10 @@ class QueryService:
                 "SELECT so.id, so.occurrence_kind, so.signature, so.condition_state, so.extraction_quality, "
                 "so.byte_start, so.byte_end, so.start_line, so.start_col, so.end_line, so.end_col, "
                 "so.file_version_id, fv.content_sha256, fv.encoding, fv.has_bom, fv.decode_clean, fv.line_count, "
+                "pr.parser_name, pr.parser_version, "
                 "f.repo_path, f.current_version_id, f.is_deleted "
                 "FROM symbol_occurrences so JOIN generation_tu_runs gtr ON gtr.parse_run_id = so.parse_run_id "
+                "JOIN parse_runs pr ON pr.id = so.parse_run_id "
                 "JOIN translation_units tu ON tu.id = gtr.translation_unit_id "
                 "JOIN file_versions fv ON fv.id = so.file_version_id JOIN files f ON f.id = fv.file_id "
                 "WHERE gtr.generation_id = ? AND tu.build_context_id = ? AND tu.is_active = 1 AND so.entity_id = ?",
@@ -1141,9 +1143,19 @@ class QueryService:
                     "line_count": 0, "truncated": False, "truncation_reason": None, "omitted_lines": 0, "content": None, "snippet": None,
                 }
 
-            encoding, _, _, decoded_text = detect_encoding_and_decode(
-                fresh["raw_bytes"], preferred_legacy_encoding=str(chosen["encoding"]),
-            )
+            # File versions are keyed by original byte hash. Their inventory
+            # codec can predate a corrected parser policy for those same bytes;
+            # interpret new semantic evidence using its own frozen run policy.
+            version = str(chosen["parser_version"])
+            if chosen["parser_name"] == "clang" and ";input=" in version:
+                from .parser_input import SourceBuffer
+                fallback = version.rsplit(":", 1)[1]
+                buffer = SourceBuffer.create(fresh["raw_bytes"], fallback)
+                encoding, decoded_text = buffer.encoding, buffer.parser.decode("utf-8")
+            else:
+                encoding, _, _, decoded_text = detect_encoding_and_decode(
+                    fresh["raw_bytes"], preferred_legacy_encoding=str(chosen["encoding"]),
+                )
             all_lines = decoded_text.splitlines()
             span_lines = all_lines[max(0, start_line - 1) : min(len(all_lines), end_line)]
             truncated = len(span_lines) > max_lines

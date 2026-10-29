@@ -8,8 +8,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .discovery import ensure_contained_path, inspect_source_file, resolve_repo_root
+from .discovery import ensure_contained_path, resolve_repo_root
 from .mfc import MFC_RULE_VERSION
+from .parser_input import SourceBuffer, encoding_name, policy_version
 from .models import (
     ConditionState,
     DependencyKind,
@@ -36,7 +37,7 @@ from .models import (
 )
 
 CLANG_PARSER_NAME = "clang"
-CLANG_PARSER_VERSION = "0.2.1"
+CLANG_PARSER_VERSION = "0.3.0"
 DEFAULT_MFC_RULE_VERSION = MFC_RULE_VERSION
 
 try:
@@ -179,10 +180,15 @@ class ClangParser:
         *,
         parser_version: str = CLANG_PARSER_VERSION,
         mfc_rule_version: str = DEFAULT_MFC_RULE_VERSION,
+        preferred_legacy_encoding: str = "cp1252",
+        parser_input_policy: str = "utf8-overlay",
     ) -> None:
         self.repo_root = resolve_repo_root(repo_root)
         self.parser_name = CLANG_PARSER_NAME
-        self.parser_version = parser_version
+        self.preferred_legacy_encoding = encoding_name(preferred_legacy_encoding)
+        self.parser_input_policy = parser_input_policy
+        self.parser_version = policy_version(parser_version, preferred_legacy_encoding, parser_input_policy)
+        self._source_buffers: dict[str, SourceBuffer] = {}
         self.mfc_rule_version = mfc_rule_version
         self.last_macro_offsets: dict[str, set[int]] = {}
         self.active_macro_offsets: dict[str, set[int]] = {}
@@ -409,9 +415,78 @@ class ClangParser:
 
         return args, forced_deps, diagnostics, fatal_config
 
+    def _original_offset(self, relative: str, offset: int) -> int:
+        buffer = self._source_buffers.get(relative)
+        if buffer is None or self.parser_input_policy == "native":
+            return offset
+        return buffer.original_offset(offset)
+
+    def _decode_slice(self, relative: str, raw: bytes, start: int, end: int) -> str:
+        buffer = self._source_buffers.get(relative)
+        if buffer is None:
+            buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
+        return buffer.text_slice(start, end)
+
+    def _parse_input(self, idx, main_abs, args, options, originals, hashes):
+        """Discover includes using Clang, then freeze contained source views.
+
+        Reparse only when a consumed header needs a new UTF-8 overlay. Discovery
+        diagnostics are never published. Each final consumed buffer is verified
+        against its frozen view; original disk hashes remain the evidence basis.
+        """
+        mismatches = set()
+        overlays = {}
+        for relative, raw in originals.items():
+            buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
+            self._source_buffers[relative] = buffer
+            if self.parser_input_policy == "utf8-overlay":
+                overlays[str(self.repo_root / relative)] = buffer.parser
+        for _ in range(64):
+            tu = idx.parse(str(main_abs), args=args, options=options,
+                           unsaved_files=list(overlays.items()))
+            consumed_paths = {str(main_abs)}
+            consumed_paths.update(inc.include.name for inc in tu.get_includes()
+                                  if inc.include is not None)
+            changed = False
+            for path in sorted(consumed_paths):
+                relative = self._try_repo_relative(path)
+                if relative is None:
+                    continue  # Never transcode SDK/external headers.
+                consumed = _compiled_file_bytes(tu, Path(path))
+                if consumed is None and relative in originals:
+                    mismatches.add(relative)
+                    continue
+                if relative in originals:
+                    buffer = self._source_buffers[relative]
+                    expected = (buffer.parser if self.parser_input_policy == "utf8-overlay"
+                                else buffer.original)
+                    if consumed != expected:
+                        mismatches.add(relative)
+                else:
+                    # Clang rejects UTF-16/32 BOMs before exposing a buffer. This
+                    # round is discovery only: freeze disk bytes for the next
+                    # overlay round, which must expose the exact UTF-8 view.
+                    unavailable = consumed is None
+                    raw = (self.repo_root / relative).read_bytes() if unavailable else consumed
+                    originals[relative] = raw
+                    hashes[relative] = hashlib.sha256(raw).hexdigest()
+                    buffer = SourceBuffer.create(raw, self.preferred_legacy_encoding)
+                    self._source_buffers[relative] = buffer
+                    if self.parser_input_policy == "utf8-overlay" and (unavailable or buffer.parser != raw):
+                        overlays[str(self.repo_root / relative)] = buffer.parser
+                        changed = True
+                    elif unavailable:
+                        mismatches.add(relative)
+            if not changed:
+                return tu, mismatches
+        raise ValueError("Parser input include discovery exceeded 64 overlay rounds")
+
     def parse(self, spec: TranslationUnitSpec) -> ParseRunPayload:
         """Parse a single translation unit with libclang and return its ParseRunPayload."""
         self.last_file_hashes = {}
+        self._source_buffers = {}
+        self.last_macro_offsets = {}
+        self.last_consumed_files = set()
         idx = self._ensure_index()
         try:
             main_abs, main_rel = ensure_contained_path(
@@ -476,11 +551,13 @@ class ClangParser:
 
         options = cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
         try:
-            tu = idx.parse(str(main_abs), args=clang_args, options=options)
+            tu, consumed_buffer_mismatches = self._parse_input(
+                idx, main_abs, clang_args, options, pre_bytes_by_rel, pre_hash_by_rel
+            )
         except Exception as exc:
             diag = DiagnosticRecord(
                 severity=DiagnosticSeverity.FATAL,
-                code="clang.parse_exception",
+                code="clang.unsupported_encoding" if isinstance(exc, (UnicodeError, ValueError, LookupError)) else "clang.parse_exception",
                 message=f"libclang failed to parse '{main_rel}': {exc}",
                 span=main_default_span,
                 parse_scope="tu",
@@ -495,18 +572,6 @@ class ClangParser:
                 diagnostics=(*config_diags, diag),
                 has_incomplete_dependencies=True,
             )
-
-        consumed_buffer_mismatches: set[str] = set()
-        for relative, original_hash in list(pre_hash_by_rel.items()):
-            consumed = _compiled_file_bytes(tu, self.repo_root / relative)
-            if consumed is None:
-                consumed_buffer_mismatches.add(relative)
-                continue
-            consumed_hash = hashlib.sha256(consumed).hexdigest()
-            if consumed_hash != original_hash:
-                consumed_buffer_mismatches.add(relative)
-            pre_bytes_by_rel[relative] = consumed
-            pre_hash_by_rel[relative] = consumed_hash
 
         # Collect dependencies, diagnostics, and active macro offsets
         dep_map: dict[tuple[str, str, str | None, int | None, bool, str], TUDependencyRecord] = {}
@@ -731,7 +796,8 @@ class ClangParser:
                 cindex.CursorKind.MACRO_INSTANTIATION,
                 cindex.CursorKind.MACRO_DEFINITION,
             ):
-                macro_offsets.setdefault(rel_path, set()).add(int(top_cursor.extent.start.offset))
+                macro_offsets.setdefault(rel_path, set()).add(
+                    self._original_offset(rel_path, int(top_cursor.extent.start.offset)))
                 continue
             if ckind == cindex.CursorKind.INCLUSION_DIRECTIVE:
                 continue
@@ -1100,7 +1166,7 @@ class ClangParser:
         if span is None:
             return
         snippet_bytes = raw_bytes[span.byte_start : span.byte_end]
-        snippet_text = snippet_bytes.decode("utf-8", errors="replace").strip()
+        snippet_text = self._decode_slice(rel_path, raw_bytes, span.byte_start, span.byte_end).strip()
         snippet_hash = hashlib.sha256(snippet_bytes).hexdigest()[:16]
 
         ref = cursor.referenced
@@ -1682,12 +1748,15 @@ class ClangParser:
         end_rel = self._try_repo_relative(ext.end.file.name)
         if start_rel != rel_path or end_rel != rel_path:
             return None
-        b_start = max(0, min(int(ext.start.offset), len(raw_bytes)))
-        b_end = max(b_start, min(int(ext.end.offset), len(raw_bytes)))
-        s_line = max(1, int(ext.start.line))
-        s_col = max(1, int(ext.start.column))
-        e_line = max(s_line, int(ext.end.line))
-        e_col = max(1, int(ext.end.column))
+        b_start = self._original_offset(rel_path, int(ext.start.offset))
+        b_end = max(b_start, self._original_offset(rel_path, int(ext.end.offset)))
+        buffer = self._source_buffers.get(rel_path)
+        if buffer is not None:
+            s_line, s_col = buffer.position(b_start)
+            e_line, e_col = buffer.position(b_end)
+        else:
+            s_line, s_col = max(1, int(ext.start.line)), max(1, int(ext.start.column))
+            e_line, e_col = max(s_line, int(ext.end.line)), max(1, int(ext.end.column))
         return SourceSpan(
             repo_path=rel_path,
             byte_start=b_start,
@@ -1701,8 +1770,7 @@ class ClangParser:
     def _cursor_signature(
         self, cursor: Any, rel_path: str, raw_bytes: bytes, span: SourceSpan
     ) -> str:
-        raw_slice = raw_bytes[span.byte_start : min(span.byte_end, span.byte_start + 512)]
-        text = raw_slice.decode("utf-8", errors="replace")
+        text = self._decode_slice(rel_path, raw_bytes, span.byte_start, span.byte_end)[:512]
         brace_idx = text.find("{")
         if brace_idx != -1:
             text = text[:brace_idx]
@@ -1727,21 +1795,18 @@ class ClangParser:
         )
 
     def _make_line_span(self, repo_path: str, raw_bytes: bytes, line_no: int) -> SourceSpan:
-        if not raw_bytes:
-            return SourceSpan(repo_path, 0, 0, 1, 1, 1, 1)
-        lines = raw_bytes.splitlines(keepends=True)
-        idx = max(0, min(line_no - 1, len(lines) - 1))
-        start_b = sum(len(x) for x in lines[:idx])
-        end_b = start_b + len(lines[idx])
-        return SourceSpan(
-            repo_path=repo_path,
-            byte_start=start_b,
-            byte_end=end_b,
-            start_line=idx + 1,
-            start_col=1,
-            end_line=idx + 1,
-            end_col=max(1, len(lines[idx])),
-        )
+        buffer = self._source_buffers.get(repo_path)
+        if buffer is None:
+            try:
+                buffer = SourceBuffer.create(raw_bytes, self.preferred_legacy_encoding)
+            except (UnicodeError, ValueError, LookupError):
+                return self._make_whole_file_span(repo_path, raw_bytes)
+        starts = buffer.line_starts
+        idx = max(0, min(line_no - 1, len(starts) - 1))
+        start_b = starts[idx]
+        end_b = starts[idx + 1] if idx + 1 < len(starts) else len(raw_bytes)
+        end_line, end_col = buffer.position(end_b)
+        return SourceSpan(repo_path, start_b, end_b, idx + 1, 1, end_line, end_col)
 
     def _diagnostic_span(
         self,
@@ -1762,9 +1827,12 @@ class ClangParser:
                         pre_bytes_by_rel[rel_p] = raw_b
                     except OSError:
                         raw_b = b""
-                b_off = max(0, min(int(loc.offset), len(raw_b)))
-                line = max(1, int(loc.line))
-                col = max(1, int(loc.column))
+                b_off = self._original_offset(rel_p, int(loc.offset))
+                buffer = self._source_buffers.get(rel_p)
+                if buffer is not None:
+                    line, col = buffer.position(b_off)
+                else:
+                    line, col = max(1, int(loc.line)), max(1, int(loc.column))
                 return SourceSpan(
                     repo_path=rel_p,
                     byte_start=b_off,
