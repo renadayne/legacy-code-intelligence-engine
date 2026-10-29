@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .build_context import load_build_manifest
-from .clang_parser import CLANG_PARSER_VERSION, DEFAULT_MFC_RULE_VERSION, LibclangUnavailableError
+from .clang_parser import CLANG_PARSER_VERSION, DEFAULT_MFC_RULE_VERSION, LibclangUnavailableError, ClangParser
 from .cli_queries import register_query_commands
 from .discovery import discover_repository_files, resolve_repo_root
 from .index import IndexStore
@@ -25,6 +25,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Offline source code intelligence foundation for legacy C++/MFC repositories.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_explain = subparsers.add_parser(
+        "explain-context", help="Report selected analysis settings without parsing source or opening an index.")
+    p_explain.add_argument("--repo", default=".")
+    p_explain.add_argument("--manifest", required=True)
 
     # init
     p_init = subparsers.add_parser(
@@ -396,6 +401,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if hasattr(args, 'query_handler'):
         return args.query_handler(args)
+
+    if args.command == "explain-context":
+        imported = load_build_manifest(args.repo, args.manifest)
+        engine = ClangParser(args.repo)
+        rows = [{"imported_tu_ordinal": ordinal, **engine.explain_context(spec)}
+                for ordinal, spec in enumerate(imported.translation_units, 1)]
+        print(json.dumps({"parser_version": CLANG_PARSER_VERSION,
+                          "import_warning_count": len(imported.warnings),
+                          "translation_units": rows}, indent=2))
+        return 3 if (not rows or imported.warnings or
+                     any(not row["configuration_supported"] for row in rows)) else 0
 
     if args.command == "init":
         return _cmd_init(args)

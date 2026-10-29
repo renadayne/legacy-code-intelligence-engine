@@ -1,5 +1,9 @@
 # C++ compatibility and AST performance (parser 0.3.1)
 
+For the subsequent report investigation, diagnostic-policy correction and
+`explain-context` operator command, see [parser 0.3.2 findings](SEMANTIC_REPORT_032.md).
+The wchar and cache behavior described below remains supported.
+
 ## Match the original wchar_t build mode
 
 Parser 0.3.1 recognizes `/Zc:wchar_t` and `/Zc:wchar_t-` in build-context

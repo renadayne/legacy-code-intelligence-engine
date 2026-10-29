@@ -45,6 +45,11 @@ The implemented CLI/explorer MVP follows [the technical plan](docs/IMPLEMENTATIO
 
 ## Semantic C++ Parsing & Incremental Indexing (Step 2)
 
+Parser 0.3.2 rejects diagnostic flags that could hide semantic errors. Use
+`python -m legacygraph explain-context --repo <root> --manifest <manifest>`
+to inspect selected wchar, target and Unicode settings without parsing source.
+See [remaining semantic errors and operator validation](docs/SEMANTIC_REPORT_032.md).
+
 Parser 0.3.1 supports build-context `/Zc:wchar_t` settings and a bounded AST
 path cache with containment revalidation. See [C++ compatibility, configuration
 and synthetic benchmarks](docs/CPP_COMPATIBILITY.md). The first scan after this

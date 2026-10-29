@@ -38,7 +38,7 @@ from .models import (
 )
 
 CLANG_PARSER_NAME = "clang"
-CLANG_PARSER_VERSION = "0.3.1"
+CLANG_PARSER_VERSION = "0.3.2"
 DEFAULT_MFC_RULE_VERSION = MFC_RULE_VERSION
 
 try:
@@ -99,7 +99,6 @@ _SAFE_PASSTHROUGH_FLAGS: frozenset[str] = frozenset(
         "-Wno-pragma-once-outside-header",
         "-Wno-microsoft-include",
         "-Wno-unknown-pragmas",
-        "-w",
     }
 )
 
@@ -281,7 +280,7 @@ class ClangParser:
         return result
 
     def _build_clang_args(
-        self, spec: TranslationUnitSpec, main_span: SourceSpan
+        self, spec: TranslationUnitSpec, main_span: SourceSpan | None
     ) -> tuple[list[str], list[TUDependencyRecord], list[DiagnosticRecord], bool]:
         ctx = spec.build_context
         working_dir = self._resolve_context_working_dir(spec)
@@ -437,7 +436,7 @@ class ClangParser:
                 continue
             if flag in _IGNORED_HARMLESS_FLAGS or flag.startswith(("/Fo", "/Fd", "/Fe", "/Fa", "/FR")):
                 continue
-            if flag in _SAFE_PASSTHROUGH_FLAGS or flag.startswith(("-Wno-", "-fms-")):
+            if flag in _SAFE_PASSTHROUGH_FLAGS or flag.startswith("-fms-"):
                 args.append(flag)
                 continue
             diagnostics.append(
@@ -456,6 +455,33 @@ class ClangParser:
             # Verified libclang 18.1.1 frontend option; driver -fno-wchar fails.
             args.extend(["-Xclang", "-fno-wchar"])
         return args, forced_deps, diagnostics, fatal_config
+
+    def explain_context(self, spec: TranslationUnitSpec) -> dict[str, Any]:
+        """Describe selected analysis settings without parsing source or exposing paths.
+
+        These are command-line settings, not macro state after source/header
+        preprocessing and not confirmation of the original build's settings.
+        """
+        args, _, diagnostics, fatal = self._build_clang_args(spec, None)
+        wchar_flags = [flag for flag in (*spec.build_context.extra_flags, *spec.per_file_flags)
+                       if flag in ("/Zc:wchar_t", "/Zc:wchar_t-")]
+        macros = {}
+        for name in ("UNICODE", "_UNICODE"):
+            definitions = [arg[2:] for arg in args if arg.startswith("-D")
+                           and arg[2:].split("=", 1)[0] == name]
+            macros[name] = ("undefined" if "-U" + name in args else
+                            "defined" if definitions else "unspecified")
+        return {
+            "configuration_supported": not fatal,
+            "language_standard": next(arg[5:] for arg in args if arg.startswith("-std=")),
+            "target": next((arg[9:] for arg in args if arg.startswith("--target=")), "host-default"),
+            "wchar_mode": ("unknown" if fatal else "typedef" if "-fno-wchar" in args else "native"),
+            "wchar_selection": "explicit" if wchar_flags else "default",
+            "command_line_macros": macros,
+            "diagnostic_codes": sorted({d.code for d in diagnostics}),
+            "source_preprocessing_verified": False,
+            "original_build_match": "unknown",
+        }
 
     def _phase(self, name, **fields):
         return (self._progress.phase(name, **fields) if self._progress is not None
